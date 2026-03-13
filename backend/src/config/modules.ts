@@ -19,6 +19,10 @@ export const modules: Record<string, ModuleConfig> = {
   project: {
     name: 'project',
     enabled: true // Always enabled for project generation
+  },
+  ai: {
+    name: 'ai',
+    enabled: true // Always enabled — core platform feature
   }
 };
 

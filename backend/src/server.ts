@@ -62,6 +62,13 @@ async function startServer() {
       console.log('✅ Project generation enabled');
     }
 
+    // AI generation routes (always enabled)
+    if (isModuleEnabled('ai')) {
+      const { aiRoutes } = await import('./modules/ai/ai.routes');
+      app.use('/api/ai', aiRoutes);
+      console.log('✅ AI generation module enabled');
+    }
+
     // 404 handler
     app.use((req: Request, res: Response) => {
       res.status(404).json({

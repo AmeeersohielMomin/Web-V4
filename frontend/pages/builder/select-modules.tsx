@@ -104,20 +104,20 @@ export default function SelectModules() {
   };
 
   const handleBack = () => {
-    router.push('/builder/new');
+    router.push('/builder/choose-path');
   };
 
   return (
     <div className="min-h-screen bg-black">
       {/* Subtle Grid Background */}
       <div className="fixed inset-0 bg-[linear-gradient(to_right,#4f4f4f2e_1px,transparent_1px),linear-gradient(to_bottom,#4f4f4f2e_1px,transparent_1px)] bg-[size:14px_24px] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_0%,#000_70%,transparent_110%)]" />
-      
+
       {/* Top Navigation */}
       <div className="relative border-b border-white/5">
         <div className="max-w-7xl mx-auto px-6 py-4">
           <div className="flex items-center justify-between">
             <button
-              onClick={() => router.push('/builder/new')}
+              onClick={() => router.push('/builder/choose-path')}
               className="flex items-center space-x-2 text-gray-400 hover:text-white transition-colors group"
             >
               <svg className="w-4 h-4 group-hover:-translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -168,13 +168,12 @@ export default function SelectModules() {
               key={module.id}
               onClick={() => !module.required && module.available && toggleModule(module.id)}
               disabled={!module.available}
-              className={`relative text-left p-6 rounded-2xl transition-all ${
-                selectedModules.includes(module.id)
+              className={`relative text-left p-6 rounded-2xl transition-all ${selectedModules.includes(module.id)
                   ? 'bg-white/[0.07] border-2 border-violet-500 shadow-lg shadow-violet-500/20'
                   : module.available
-                  ? 'bg-white/[0.02] border border-white/10 hover:bg-white/[0.04] hover:border-white/20'
-                  : 'bg-white/[0.01] border border-white/5 cursor-not-allowed opacity-40'
-              }`}
+                    ? 'bg-white/[0.02] border border-white/10 hover:bg-white/[0.04] hover:border-white/20'
+                    : 'bg-white/[0.01] border border-white/5 cursor-not-allowed opacity-40'
+                }`}
             >
               {/* Selection Indicator */}
               {selectedModules.includes(module.id) && (
@@ -255,7 +254,7 @@ export default function SelectModules() {
             </svg>
             <span>Back</span>
           </button>
-          
+
           <button
             onClick={handleNext}
             disabled={selectedModules.length === 0}

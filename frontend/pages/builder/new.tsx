@@ -41,7 +41,7 @@ export default function NewProject() {
     }
     // Save to localStorage and go to module selection
     localStorage.setItem('builderProject', JSON.stringify({ projectName }));
-    router.push('/builder/select-modules');
+    router.push('/builder/choose-path');
   };
 
   if (loading) {
@@ -160,15 +160,15 @@ export default function NewProject() {
                 <div className="space-y-2.5 text-sm text-gray-400">
                   <div className="flex items-start">
                     <span className="text-blue-400 mr-2">1.</span>
-                    <span>Select features and modules for your project</span>
+                    <span>Choose your build method — AI or Templates</span>
                   </div>
                   <div className="flex items-start">
                     <span className="text-blue-400 mr-2">2.</span>
-                    <span>Choose your preferred UI design style</span>
+                    <span>AI: describe your app → get instant full-stack code</span>
                   </div>
                   <div className="flex items-start">
                     <span className="text-blue-400 mr-2">3.</span>
-                    <span>Configure database and authentication</span>
+                    <span>Templates: pick modules → choose design → configure backend</span>
                   </div>
                   <div className="flex items-start">
                     <span className="text-blue-400 mr-2">4.</span>

@@ -113,6 +113,8 @@ export default function AIGenerate() {
     const [progress, setProgress] = useState(0);
     const streamBoxRef = useRef<HTMLDivElement>(null);
     const projectFinalizedRef = useRef(false);
+    const [viewMode, setViewMode] = useState<'code' | 'preview'>('code');
+    const iframeRef = useRef<HTMLIFrameElement>(null);
 
     useEffect(() => {
         const saved = localStorage.getItem('builderProject');
@@ -142,6 +144,7 @@ export default function AIGenerate() {
             return next;
         });
     };
+
 
     const generate = async (prompt: string, isRefinement = false) => {
         setError('');
@@ -340,6 +343,53 @@ export default function AIGenerate() {
     const providerLabel = projectData?.aiProvider === 'openai' ? 'GPT-4o' : projectData?.aiProvider === 'anthropic' ? 'Claude' : 'Gemini';
 
     const activeFileContent = generatedProject?.files.find(f => f.path === activeFile)?.content || '';
+
+    // Update preview when code or active file changes
+    useEffect(() => {
+        if (viewMode !== 'preview' || !iframeRef.current || !activeFileContent || !activeFile) return;
+
+        // Only preview frontend files (tsx/jsx/html)
+        const isFrontend =
+            activeFile.includes('frontend') &&
+            (activeFile.endsWith('.tsx') || activeFile.endsWith('.jsx') || activeFile.endsWith('.html'));
+
+        if (!isFrontend) return;
+
+        iframeRef.current.contentWindow?.postMessage(
+            {
+                type: 'UPDATE_PREVIEW',
+                code: activeFileContent,
+                files: generatedProject?.files || [],
+                filePath: activeFile
+            },
+            '*'
+        );
+    }, [viewMode, activeFile, activeFileContent, generatedProject]);
+
+    // Listen for messages from preview runner
+    useEffect(() => {
+        const handleMessage = (event: MessageEvent) => {
+            if (event.data?.type !== 'PREVIEW_READY' || !activeFileContent || !activeFile) return;
+
+            const isFrontend =
+                activeFile.includes('frontend') &&
+                (activeFile.endsWith('.tsx') || activeFile.endsWith('.jsx') || activeFile.endsWith('.html'));
+
+            if (!isFrontend) return;
+
+            iframeRef.current?.contentWindow?.postMessage(
+                {
+                    type: 'UPDATE_PREVIEW',
+                    code: activeFileContent,
+                    files: generatedProject?.files || [],
+                    filePath: activeFile
+                },
+                '*'
+            );
+        };
+        window.addEventListener('message', handleMessage);
+        return () => window.removeEventListener('message', handleMessage);
+    }, [activeFileContent, activeFile, generatedProject]);
     const fileTree = generatedProject ? buildFileTree(generatedProject.files) : [];
 
     // ─── Render file tree recursively ───
@@ -551,12 +601,33 @@ export default function AIGenerate() {
                         <div className="flex-1 flex flex-col min-w-0">
                             {activeFile ? (
                                 <>
-                                    {/* File header */}
+                                    {/* File header with Toggle */}
                                     <div className="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-zinc-900/30 flex-shrink-0">
-                                        <div className="flex items-center space-x-2 min-w-0">
-                                            <span className="text-sm">{getFileIcon(activeFile)}</span>
-                                            <span className="text-xs font-mono text-gray-400 truncate">{activeFile}</span>
+                                        <div className="flex items-center space-x-4 min-w-0">
+                                            <div className="flex items-center space-x-2 min-w-0">
+                                                <span className="text-sm">{getFileIcon(activeFile)}</span>
+                                                <span className="text-xs font-mono text-gray-400 truncate">{activeFile}</span>
+                                            </div>
+                                            
+                                            {/* Code/Preview Toggle */}
+                                            {activeFile.includes('frontend') && (activeFile.endsWith('.tsx') || activeFile.endsWith('.jsx') || activeFile.endsWith('.html')) && (
+                                                <div className="flex items-center bg-black/40 rounded-lg p-0.5 border border-white/5 mx-2">
+                                                    <button
+                                                        onClick={() => setViewMode('code')}
+                                                        className={`px-3 py-1 text-[10px] rounded-md transition-all ${viewMode === 'code' ? 'bg-white/10 text-white shadow-sm' : 'text-gray-500 hover:text-gray-300'}`}
+                                                    >
+                                                        Code
+                                                    </button>
+                                                    <button
+                                                        onClick={() => setViewMode('preview')}
+                                                        className={`px-3 py-1 text-[10px] rounded-md transition-all ${viewMode === 'preview' ? 'bg-white/10 text-white shadow-sm' : 'text-gray-500 hover:text-gray-300'}`}
+                                                    >
+                                                        Preview
+                                                    </button>
+                                                </div>
+                                            )}
                                         </div>
+                                        
                                         <div className="flex items-center space-x-2 flex-shrink-0">
                                             <span className="text-[10px] text-gray-600">{activeFileContent.split('\n').length} lines</span>
                                             <button
@@ -568,16 +639,34 @@ export default function AIGenerate() {
                                         </div>
                                     </div>
 
-                                    {/* Code with line numbers */}
-                                    <div className="flex-1 overflow-auto bg-zinc-950/50">
-                                        <pre className="p-4 text-xs font-mono leading-relaxed">
-                                            {activeFileContent.split('\n').map((line, i) => (
-                                                <div key={i} className="flex hover:bg-white/[0.02]">
-                                                    <span className="inline-block w-10 text-right pr-4 text-gray-700 select-none flex-shrink-0">{i + 1}</span>
-                                                    <code className="text-gray-300 flex-1 whitespace-pre-wrap break-all">{line || ' '}</code>
+                                    {/* Content (Code or Preview) */}
+                                    <div className="flex-1 overflow-hidden bg-zinc-950/50 relative">
+                                        {/* Code View */}
+                                        <div className={`h-full overflow-auto ${viewMode === 'code' ? 'block' : 'hidden'}`}>
+                                            <pre className="p-4 text-xs font-mono leading-relaxed">
+                                                {activeFileContent.split('\n').map((line, i) => (
+                                                    <div key={i} className="flex hover:bg-white/[0.02]">
+                                                        <span className="inline-block w-10 text-right pr-4 text-gray-700 select-none flex-shrink-0">{i + 1}</span>
+                                                        <code className="text-gray-300 flex-1 whitespace-pre-wrap break-all">{line || ' '}</code>
+                                                    </div>
+                                                ))}
+                                            </pre>
+                                        </div>
+
+                                        {/* Preview View (Pre-warmed) */}
+                                        <div className={`h-full w-full bg-black relative ${viewMode === 'preview' ? 'block' : 'absolute inset-0 pointer-events-none opacity-0'}`}>
+                                            <iframe
+                                                ref={iframeRef}
+                                                src="/builder/preview-runner"
+                                                className="w-full h-full border-none"
+                                                title="Live Preview"
+                                            />
+                                            {viewMode === 'preview' && !activeFileContent && (
+                                                <div className="absolute inset-0 flex items-center justify-center text-gray-500 text-sm bg-black/80">
+                                                    Preparing preview...
                                                 </div>
-                                            ))}
-                                        </pre>
+                                            )}
+                                        </div>
                                     </div>
                                 </>
                             ) : (

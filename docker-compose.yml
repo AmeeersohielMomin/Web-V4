@@ -1,0 +1,57 @@
+version: '3.9'
+services:
+  mongodb:
+    image: mongo:7
+    environment:
+      MONGO_INITDB_DATABASE: idea_platform
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: mongodb://mongodb:27017/idea_platform
+      JWT_SECRET: ${JWT_SECRET}
+      PORT: 5000
+      NODE_ENV: production
+      FRONTEND_URL: ${FRONTEND_URL}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      OLLAMA_URL: ${OLLAMA_URL}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      STRIPE_STARTER_PRICE_ID: ${STRIPE_STARTER_PRICE_ID}
+      STRIPE_PRO_PRICE_ID: ${STRIPE_PRO_PRICE_ID}
+      ENABLED_MODULES: auth,project,ai
+      SENTRY_DSN: ${SENTRY_DSN}
+    ports:
+      - "5000:5000"
+    depends_on:
+      - mongodb
+      - redis
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+      NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY}
+      NEXT_PUBLIC_SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  mongodb_data:

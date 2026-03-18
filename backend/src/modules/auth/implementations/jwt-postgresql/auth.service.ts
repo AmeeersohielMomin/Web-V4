@@ -1,6 +1,7 @@
 import { Pool } from 'pg';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
+import type { SignOptions } from 'jsonwebtoken';
 
 // PostgreSQL User model using raw queries
 interface User {
@@ -65,10 +66,11 @@ export class AuthService {
       const user = result.rows[0];
 
       // Generate JWT
+      const signOptions: SignOptions = { expiresIn: '7d' };
       const token = jwt.sign(
         { userId: user.id, email: user.email },
         process.env.JWT_SECRET || 'your-secret-key',
-        { expiresIn: '7d' }
+        signOptions
       );
 
       return {
@@ -102,10 +104,11 @@ export class AuthService {
       }
 
       // Generate JWT
+      const signOptions: SignOptions = { expiresIn: '7d' };
       const token = jwt.sign(
         { userId: user.id, email: user.email },
         process.env.JWT_SECRET || 'your-secret-key',
-        { expiresIn: '7d' }
+        signOptions
       );
 
       return {

@@ -33,7 +33,7 @@ export const AuthForm: React.FC<AuthFormProps> = ({
       <div className="relative z-10 max-w-md w-full">
         {/* Logo */}
         <div className="text-center mb-8">
-          <Link href="/home" className="inline-flex items-center space-x-2 mb-4">
+          <Link href="/" className="inline-flex items-center space-x-2 mb-4">
             <div className="w-10 h-10 bg-white rounded-lg flex items-center justify-center">
               <span className="text-black font-bold text-xl">T</span>
             </div>

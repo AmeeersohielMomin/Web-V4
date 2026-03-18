@@ -1,17 +1,18 @@
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
+import type { SignOptions } from 'jsonwebtoken';
 import { User } from './auth.model';
 import { SignupInput, LoginInput } from './auth.schema';
 
 export class AuthService {
   private saltRounds: number;
   private jwtSecret: string;
-  private jwtExpiresIn: string;
+  private jwtExpiresIn: SignOptions['expiresIn'];
 
   constructor() {
     this.saltRounds = parseInt(process.env.BCRYPT_SALT_ROUNDS || '10');
     this.jwtSecret = process.env.JWT_SECRET!;
-    this.jwtExpiresIn = process.env.JWT_EXPIRES_IN || '7d';
+    this.jwtExpiresIn = (process.env.JWT_EXPIRES_IN || '7d') as SignOptions['expiresIn'];
   }
 
   async signup(input: SignupInput) {
@@ -31,10 +32,11 @@ export class AuthService {
     });
 
     // Generate JWT
+    const signOptions: SignOptions = { expiresIn: this.jwtExpiresIn };
     const token = jwt.sign(
       { userId: user._id.toString(), email: user.email },
       this.jwtSecret,
-      { expiresIn: this.jwtExpiresIn }
+      signOptions
     );
 
     return {
@@ -60,10 +62,11 @@ export class AuthService {
     }
 
     // Generate JWT
+    const signOptions: SignOptions = { expiresIn: this.jwtExpiresIn };
     const token = jwt.sign(
       { userId: user._id.toString(), email: user.email },
       this.jwtSecret,
-      { expiresIn: this.jwtExpiresIn }
+      signOptions
     );
 
     return {

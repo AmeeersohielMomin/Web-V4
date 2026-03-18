@@ -33,7 +33,11 @@ export class ProjectService {
     this.addDocumentation(archive, modules, templates, backends);
   }
 
-  private async generateBackend(archive: archiver.Archiver, modules: string[]) {
+  private async generateBackend(
+    archive: archiver.Archiver,
+    modules: string[],
+    _backends: { [key: string]: string } = {}
+  ) {
     // Backend package.json
     archive.append(this.getBackendPackageJson(), { 
       name: 'backend/package.json' 
@@ -65,7 +69,11 @@ export class ProjectService {
     });
   }
 
-  private async generateFrontend(archive: archiver.Archiver, modules: string[]) {
+  private async generateFrontend(
+    archive: archiver.Archiver,
+    modules: string[],
+    _templates: { [key: string]: string } = {}
+  ) {
     // Frontend package.json
     archive.append(this.getFrontendPackageJson(), { 
       name: 'frontend/package.json' 
@@ -188,12 +196,20 @@ export class ProjectService {
     }
   }
 
-  private addEnvironmentFiles(archive: archiver.Archiver) {
+  private addEnvironmentFiles(
+    archive: archiver.Archiver,
+    _backends: { [key: string]: string } = {}
+  ) {
     archive.append(this.getBackendEnvExample(), { name: 'backend/.env.example' });
     archive.append(this.getFrontendEnvExample(), { name: 'frontend/.env.local.example' });
   }
 
-  private addDocumentation(archive: archiver.Archiver, modules: string[]) {
+  private addDocumentation(
+    archive: archiver.Archiver,
+    modules: string[],
+    _templates: { [key: string]: string } = {},
+    _backends: { [key: string]: string } = {}
+  ) {
     archive.append(this.generateQuickStart(modules), { name: 'QUICKSTART.md' });
     archive.append(this.generateArchitectureDoc(modules), { name: 'ARCHITECTURE.md' });
   }

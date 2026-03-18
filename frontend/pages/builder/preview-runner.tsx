@@ -133,6 +133,92 @@ export default function PreviewRunner() {
       };
     };
 
+    const createMuiTheme = () => ({
+      palette: {
+        mode: 'light',
+        common: { black: '#000000', white: '#ffffff' },
+        primary: { main: '#6366f1', contrastText: '#ffffff' },
+        secondary: { main: '#0ea5e9', contrastText: '#ffffff' },
+        background: { default: '#ffffff', paper: '#f8fafc' },
+        text: { primary: '#111827', secondary: '#4b5563' }
+      }
+    });
+
+    const createMUIStylesModule = (ReactRuntime: any) => {
+      const theme = createMuiTheme();
+
+      const ThemeProvider = ({ children }: any) =>
+        ReactRuntime.createElement(ReactRuntime.Fragment, null, children);
+
+      return {
+        __esModule: true,
+        createTheme: () => theme,
+        ThemeProvider,
+        styled: (Component: any) => () => Component,
+        useTheme: () => theme,
+        default: {
+          createTheme: () => theme,
+          ThemeProvider,
+          styled: (Component: any) => () => Component,
+          useTheme: () => theme
+        }
+      };
+    };
+
+    const createMUIComponentModule = (ReactRuntime: any) => {
+      return new Proxy(
+        {
+          __esModule: true
+        },
+        {
+          get: (_target, key) => {
+            if (key === '__esModule') return true;
+            if (key === 'default') {
+              return ({ children, ...props }: any) =>
+                ReactRuntime.createElement('div', props, children);
+            }
+            return ({ children, ...props }: any) =>
+              ReactRuntime.createElement('div', props, children);
+          }
+        }
+      );
+    };
+
+    const createRuntimeErrorBoundary = (ReactRuntime: any) => {
+      return class RuntimeErrorBoundary extends ReactRuntime.Component<
+        { children: any },
+        { error: string | null }
+      > {
+        constructor(props: any) {
+          super(props);
+          this.state = { error: null };
+        }
+
+        static getDerivedStateFromError(error: any) {
+          return { error: error?.message || String(error) };
+        }
+
+        componentDidCatch(error: any) {
+          console.error('[PreviewEngine] Component render error:', error);
+        }
+
+        render() {
+          if (this.state.error) {
+            return ReactRuntime.createElement(
+              'div',
+              {
+                className:
+                  'm-4 rounded border border-rose-500/40 bg-rose-950/30 p-4 text-sm text-rose-300'
+              },
+              `Preview error: ${this.state.error}`
+            );
+          }
+
+          return this.props.children;
+        }
+      };
+    };
+
     const renderCode = (payload: PreviewMessage) => {
       try {
         setError(null);
@@ -216,21 +302,34 @@ export default function PreviewRunner() {
 
         const findFile = (request: string, importer: string): PreviewFile | null => {
           if (request.startsWith('@/')) {
-            const aliasPath = normalizePath(request.replace(/^@\//, 'frontend/src/'));
-            const aliasCandidates = [
-              aliasPath,
-              `${aliasPath}.tsx`,
-              `${aliasPath}.ts`,
-              `${aliasPath}.jsx`,
-              `${aliasPath}.js`,
-              `${aliasPath}/index.tsx`,
-              `${aliasPath}/index.ts`,
-              `${aliasPath}/index.jsx`,
-              `${aliasPath}/index.js`
+            const aliasSuffix = normalizePath(request.replace(/^@\//, ''));
+            const aliasBases = [
+              normalizePath(`frontend/src/${aliasSuffix}`),
+              normalizePath(`frontend/${aliasSuffix}`),
+              normalizePath(aliasSuffix)
             ];
 
-            const aliasFile = normalizedFiles.find((f) => aliasCandidates.includes(f.path));
-            if (aliasFile) return { path: aliasFile.path, content: aliasFile.content };
+            for (const base of aliasBases) {
+              const aliasCandidates = [
+                base,
+                `${base}.tsx`,
+                `${base}.ts`,
+                `${base}.jsx`,
+                `${base}.js`,
+                `${base}/index.tsx`,
+                `${base}/index.ts`,
+                `${base}/index.jsx`,
+                `${base}/index.js`
+              ];
+
+              const aliasFile = normalizedFiles.find((f) => aliasCandidates.includes(f.path));
+              if (aliasFile) return { path: aliasFile.path, content: aliasFile.content };
+
+              const aliasBySuffix = normalizedFiles.find((f) =>
+                aliasCandidates.some((c) => f.path.endsWith(`/${c}`) || f.path === c)
+              );
+              if (aliasBySuffix) return { path: aliasBySuffix.path, content: aliasBySuffix.content };
+            }
           }
 
           const base = resolveImportPath(importer, request);
@@ -262,6 +361,19 @@ export default function PreviewRunner() {
             return moduleCache.get(normalizedModulePath);
           }
 
+          const sanitizeSourceCode = (input: string): string => {
+            let output = input.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n');
+
+            // Some model outputs occasionally prefix declarations with a stray backslash
+            // (e.g. "\\export"), which breaks Babel parsing.
+            output = output.replace(
+              /(^|\n)([ \t]*)\\+(?=(export|import|const|let|var|function|class|interface|type|enum)\b)/g,
+              '$1$2'
+            );
+
+            return output;
+          };
+
           const module = { exports: {} as any };
           moduleCache.set(normalizedModulePath, module.exports);
 
@@ -270,6 +382,15 @@ export default function PreviewRunner() {
             if (request === 'react-dom') return ReactDOMRuntime;
             if (request === 'process' || request === 'node:process') return mockProcess;
             if (request === 'axios') return createAxiosMockModule();
+            if (request === '@mui/material/styles') {
+              return createMUIStylesModule(ReactRuntime);
+            }
+            if (request === '@mui/material' || request.startsWith('@mui/material/')) {
+              return createMUIComponentModule(ReactRuntime);
+            }
+            if (request.startsWith('@mui/icons-material')) {
+              return createMUIComponentModule(ReactRuntime);
+            }
             if (request === 'next/head') {
               return ({ children }: any) => ReactRuntime.createElement(ReactRuntime.Fragment, null, children);
             }
@@ -374,7 +495,7 @@ export default function PreviewRunner() {
             return createMockModule(ReactRuntime, request);
           };
 
-          const transformed = Babel.transform(sourceCode, {
+          const transformed = Babel.transform(sanitizeSourceCode(sourceCode), {
             presets: ['react', 'typescript'],
             plugins: ['transform-modules-commonjs'],
             filename: normalizedModulePath,
@@ -410,10 +531,20 @@ export default function PreviewRunner() {
           throw new Error("No renderable component found. Use default export, named App, or a React component export.");
         }
 
+        const RuntimeErrorBoundary = createRuntimeErrorBoundary(ReactRuntime);
+
         if (ReactRuntime.isValidElement(candidate)) {
-          rootRef.current.render(candidate);
+          rootRef.current.render(
+            ReactRuntime.createElement(RuntimeErrorBoundary, null, candidate)
+          );
         } else {
-          rootRef.current.render(ReactRuntime.createElement(candidate));
+          rootRef.current.render(
+            ReactRuntime.createElement(
+              RuntimeErrorBoundary,
+              null,
+              ReactRuntime.createElement(candidate)
+            )
+          );
         }
       } catch (err: any) {
         console.error('[PreviewEngine] Render failure:', err);

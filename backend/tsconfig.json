@@ -10,8 +10,15 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "moduleResolution": "node"
+    "moduleResolution": "node",
+    "typeRoots": ["./src/types", "./node_modules/@types"]
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/modules/auth/implementations/jwt-mysql",
+    "src/modules/auth/implementations/jwt-postgresql",
+    "src/modules/auth/implementations/session-based"
+  ]
 }

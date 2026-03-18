@@ -1,6 +1,7 @@
 import mysql from 'mysql2/promise';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
+import type { SignOptions } from 'jsonwebtoken';
 
 // MySQL User model
 interface User {
@@ -67,10 +68,11 @@ export class AuthService {
       const userId = result.insertId;
 
       // Generate JWT
+      const signOptions: SignOptions = { expiresIn: '7d' };
       const token = jwt.sign(
         { userId, email: email.toLowerCase() },
         process.env.JWT_SECRET || 'your-secret-key',
-        { expiresIn: '7d' }
+        signOptions
       );
 
       return {
@@ -104,10 +106,11 @@ export class AuthService {
       }
 
       // Generate JWT
+      const signOptions: SignOptions = { expiresIn: '7d' };
       const token = jwt.sign(
         { userId: user.id, email: user.email },
         process.env.JWT_SECRET || 'your-secret-key',
-        { expiresIn: '7d' }
+        signOptions
       );
 
       return {

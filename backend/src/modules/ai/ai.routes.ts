@@ -1,6 +1,9 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import rateLimit from 'express-rate-limit';
 import { aiController } from './ai.controller';
+import { optionalAuth } from '../../middleware/auth.middleware';
+import { generationLimiter } from '../../middleware/rateLimit.middleware';
+import { checkGenerationQuota } from '../../middleware/generationQuota.middleware';
 
 const router = Router();
 
@@ -35,8 +38,15 @@ const freeTierLimiter = rateLimit({
 
 // Routes
 router.get('/providers', (req, res) => aiController.getProviders(req, res));
-router.post('/generate', freeTierLimiter, (req, res) => aiController.generate(req, res));
+router.post(
+    '/generate',
+    freeTierLimiter,
+    generationLimiter,
+    optionalAuth,
+    checkGenerationQuota,
+    (req, res) => aiController.generate(req, res)
+);
 router.post('/design-to-code', freeTierLimiter, (req, res) => aiController.designToCode(req, res));
-router.post('/refine', freeTierLimiter, (req, res) => aiController.refine(req, res));
+router.post('/refine', freeTierLimiter, optionalAuth, (req, res) => aiController.refine(req, res));
 
 export { router as aiRoutes };

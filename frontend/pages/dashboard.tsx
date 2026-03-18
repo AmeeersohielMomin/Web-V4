@@ -1,302 +1,265 @@
-import React, { useEffect, useState } from 'react';
-import { useRouter } from 'next/router';
 import Link from 'next/link';
-import { authService } from '@/templates/auth/services/auth.service';
+import { useRouter } from 'next/router';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import Navbar from '@/components/Navbar';
+import ProjectCard, { type DashboardProject } from '@/components/ProjectCard';
+import ProtectedRoute from '@/components/ProtectedRoute';
+import UsageMeter from '@/components/UsageMeter';
+import { useAuth } from '@/contexts/AuthContext';
+import api from '@/lib/api';
 
-interface Module {
-  id: string;
-  name: string;
-  description: string;
-  icon: string;
-  available: boolean;
+function mapProject(raw: any): DashboardProject {
+  return {
+    id: String(raw._id || raw.id),
+    name: String(raw.name || 'Untitled Project'),
+    modules: Array.isArray(raw.modules) ? raw.modules : [],
+    template: String(raw.template || 'default'),
+    backend: String(raw.backend || 'express'),
+    status: String(raw.status || 'complete'),
+    fileCount: Number(raw.fileCount || 0),
+    updatedAt: String(raw.updatedAt || new Date().toISOString()),
+    vercelDeployUrl: raw.vercelDeployUrl ? String(raw.vercelDeployUrl) : undefined,
+    githubRepoUrl: raw.githubRepoUrl ? String(raw.githubRepoUrl) : undefined,
+    railwayServiceUrl: raw.railwayServiceUrl ? String(raw.railwayServiceUrl) : undefined
+  };
 }
 
-export default function Dashboard() {
+export default function DashboardPage() {
   const router = useRouter();
-  const [user, setUser] = useState<{ id: string; email: string } | null>(null);
-  const [loading, setLoading] = useState(true);
+  const { user, logout, refreshUser } = useAuth();
+  const [projects, setProjects] = useState<DashboardProject[]>([]);
+  const [loadingProjects, setLoadingProjects] = useState(true);
+  const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
+  const [billingLoading, setBillingLoading] = useState(false);
+  const [error, setError] = useState('');
 
-  const availableModules: Module[] = [
-    {
-      id: 'auth',
-      name: 'Authentication',
-      description: 'User signup, login, JWT authentication',
-      icon: '🔐',
-      available: true
-    },
-    {
-      id: 'blog',
-      name: 'Blog System',
-      description: 'Create, edit, and manage blog posts',
-      icon: '📝',
-      available: false
-    },
-    {
-      id: 'ecommerce',
-      name: 'E-Commerce',
-      description: 'Products, cart, checkout functionality',
-      icon: '🛒',
-      available: false
-    },
-    {
-      id: 'payments',
-      name: 'Payment Processing',
-      description: 'Stripe, PayPal integration',
-      icon: '💳',
-      available: false
-    },
-    {
-      id: 'admin',
-      name: 'Admin Dashboard',
-      description: 'User management, analytics',
-      icon: '⚙️',
-      available: false
-    },
-    {
-      id: 'notifications',
-      name: 'Notifications',
-      description: 'Email, SMS, push notifications',
-      icon: '🔔',
-      available: false
+  const fetchProjects = useCallback(async () => {
+    setError('');
+    setLoadingProjects(true);
+    try {
+      const response = await api.get('/api/platform/projects');
+      const rawProjects = response.data?.data?.projects || [];
+      setProjects(rawProjects.map(mapProject));
+      await refreshUser();
+    } catch (err: any) {
+      setError(err?.response?.data?.error || 'Unable to load your projects');
+    } finally {
+      setLoadingProjects(false);
     }
-  ];
+  }, [refreshUser]);
 
   useEffect(() => {
-    const checkAuth = async () => {
-      const token = authService.getToken();
-      if (!token) {
-        router.push('/login');
-        return;
-      }
+    void fetchProjects();
+  }, [fetchProjects]);
 
-      try {
-        const response = await authService.me(token);
-        if (response.success && response.data?.user) {
-          setUser(response.data.user);
-        } else {
-          router.push('/login');
-        }
-      } catch (error) {
-        console.error('Auth check failed:', error);
-        router.push('/login');
-      } finally {
-        setLoading(false);
-      }
-    };
+  const sortedProjects = useMemo(
+    () =>
+      [...projects].sort(
+        (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+      ),
+    [projects]
+  );
 
-    checkAuth();
-  }, [router]);
-
-  const handleLogout = () => {
-    authService.removeToken();
-    router.push('/');
+  const handleOpen = (project: DashboardProject) => {
+    void router.push(`/builder/ai-generate?projectId=${project.id}`);
   };
 
-  if (loading) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-black">
-        <div className="flex flex-col items-center space-y-4">
-          <svg className="animate-spin h-12 w-12 text-white" fill="none" viewBox="0 0 24 24">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-          </svg>
-          <p className="text-gray-400">Loading your dashboard...</p>
-        </div>
-      </div>
-    );
-  }
+  const handleDownload = async (project: DashboardProject) => {
+    setActionLoadingId(project.id);
+    try {
+      const response = await api.get(`/api/platform/projects/${project.id}/download`, {
+        responseType: 'blob'
+      });
+
+      const url = window.URL.createObjectURL(response.data as Blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${project.name}.zip`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err: any) {
+      setError(err?.response?.data?.error || 'Failed to download project');
+    } finally {
+      setActionLoadingId(null);
+    }
+  };
+
+  const handleDelete = async (project: DashboardProject) => {
+    const confirmed = window.confirm(`Delete ${project.name}? This cannot be undone.`);
+    if (!confirmed) {
+      return;
+    }
+
+    setActionLoadingId(project.id);
+    try {
+      await api.delete(`/api/platform/projects/${project.id}`);
+      setProjects((current) => current.filter((item) => item.id !== project.id));
+    } catch (err: any) {
+      setError(err?.response?.data?.error || 'Failed to delete project');
+    } finally {
+      setActionLoadingId(null);
+    }
+  };
+
+  const handleUpgrade = async (planId: 'starter' | 'pro') => {
+    setBillingLoading(true);
+    setError('');
+    try {
+      const response = await api.post('/api/platform/billing/checkout', { planId });
+      const checkoutUrl = response.data?.data?.url;
+      if (!checkoutUrl) {
+        throw new Error('Missing checkout URL');
+      }
+      window.location.href = checkoutUrl;
+    } catch (err: any) {
+      setError(err?.response?.data?.error || 'Unable to start checkout');
+      setBillingLoading(false);
+    }
+  };
+
+  const handleManageBilling = async () => {
+    setBillingLoading(true);
+    setError('');
+    try {
+      const response = await api.post('/api/platform/billing/portal');
+      const portalUrl = response.data?.data?.url;
+      if (!portalUrl) {
+        throw new Error('Missing portal URL');
+      }
+      window.location.href = portalUrl;
+    } catch (err: any) {
+      setError(err?.response?.data?.error || 'Unable to open billing portal');
+      setBillingLoading(false);
+    }
+  };
+
+  const hasReachedLimit =
+    (user?.generationsLimit || 0) !== -1 &&
+    (user?.generationsUsed || 0) >= (user?.generationsLimit || 0);
 
   return (
-    <div className="min-h-screen bg-black text-white">
-      {/* Animated Grid Background */}
-      <div className="fixed inset-0 bg-black">
-        <div className="absolute inset-0 bg-[linear-gradient(to_right,#1f1f1f_1px,transparent_1px),linear-gradient(to_bottom,#1f1f1f_1px,transparent_1px)] bg-[size:4rem_4rem] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_0%,#000_70%,transparent_100%)]" />
-      </div>
+    <ProtectedRoute>
+      <div className="min-h-screen bg-slate-50">
+        {user && <Navbar user={user} onLogout={logout} />}
 
-      {/* Content */}
-      <div className="relative z-10">
-        {/* Header */}
-        <nav className="fixed w-full bg-black/80 backdrop-blur-xl border-b border-white/10 z-50">
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div className="flex justify-between items-center h-16">
-              <div className="flex items-center space-x-2">
-                <div className="w-8 h-8 bg-white rounded-lg flex items-center justify-center">
-                  <span className="text-black font-bold text-lg">T</span>
-                </div>
-                <span className="text-white font-bold text-xl">TemplateBuilder</span>
-              </div>
-              <div className="flex items-center space-x-6">
-                <Link href="/home" className="text-gray-400 hover:text-white transition text-sm">
-                  Home
-                </Link>
-                <Link href="/builder/new" className="text-gray-400 hover:text-white transition text-sm">
-                  New Project
-                </Link>
-                <div className="flex items-center space-x-3 pl-6 border-l border-white/10">
-                  <div className="text-sm text-gray-400">{user?.email}</div>
-                  <button
-                    onClick={handleLogout}
-                    className="px-4 py-2 text-sm font-medium text-white bg-white/10 hover:bg-white/20 rounded-lg border border-white/10 transition"
-                  >
-                    Logout
-                  </button>
-                </div>
-              </div>
+        <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h1 className="text-3xl font-bold text-slate-900">Project Dashboard</h1>
+              <p className="text-sm text-slate-600">Manage your generated full-stack builds.</p>
             </div>
-          </div>
-        </nav>
-
-        {/* Main Content */}
-        <div className="pt-24 pb-12 px-4 sm:px-6 lg:px-8">
-          <div className="max-w-7xl mx-auto">
-            {/* Welcome Section */}
-            <div className="mb-12">
-              <div className="inline-block mb-4 px-4 py-1.5 bg-white/5 border border-white/10 rounded-full">
-                <span className="text-xs text-gray-400">👋 Welcome back</span>
-              </div>
-              <h2 className="text-4xl md:text-5xl font-bold text-white mb-4">
-                Your Dashboard
-              </h2>
-              <p className="text-xl text-gray-400 max-w-2xl">
-                Build amazing full-stack applications with our modular templates
-              </p>
-            </div>
-
-            {/* Quick Actions */}
-            <div className="mb-12 grid md:grid-cols-3 gap-6">
+            <div className="flex gap-2">
+              <button
+                onClick={() => void fetchProjects()}
+                className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100"
+              >
+                Refresh
+              </button>
               <Link
                 href="/builder/new"
-                className="group bg-white/[0.03] backdrop-blur-xl rounded-2xl border border-white/10 p-6 hover:bg-white/[0.05] hover:border-white/20 transition-all"
+                className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
               >
-                <div className="flex items-center space-x-4">
-                  <div className="w-12 h-12 bg-white rounded-lg flex items-center justify-center group-hover:scale-110 transition">
-                    <svg className="w-6 h-6 text-black" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-                    </svg>
-                  </div>
-                  <div>
-                    <h3 className="font-semibold text-white mb-1">New Project</h3>
-                    <p className="text-sm text-gray-400">Start building now</p>
-                  </div>
-                </div>
+                New Project
               </Link>
-
-              <Link
-                href="/templates/preview"
-                className="group bg-white/[0.03] backdrop-blur-xl rounded-2xl border border-white/10 p-6 hover:bg-white/[0.05] hover:border-white/20 transition-all"
-              >
-                <div className="flex items-center space-x-4">
-                  <div className="w-12 h-12 bg-white/10 rounded-lg flex items-center justify-center group-hover:scale-110 transition border border-white/10">
-                    <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                    </svg>
-                  </div>
-                  <div>
-                    <h3 className="font-semibold text-white mb-1">Preview Templates</h3>
-                    <p className="text-sm text-gray-400">See all designs</p>
-                  </div>
-                </div>
-              </Link>
-
-              <div className="group bg-white/[0.03] backdrop-blur-xl rounded-2xl border border-white/10 p-6">
-                <div className="flex items-center space-x-4">
-                  <div className="w-12 h-12 bg-white/10 rounded-lg flex items-center justify-center border border-white/10">
-                    <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                    </svg>
-                  </div>
-                  <div>
-                    <h3 className="font-semibold text-white mb-1">Documentation</h3>
-                    <p className="text-sm text-gray-400">Learn how it works</p>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Available Modules */}
-            <div className="mb-12">
-              <h3 className="text-2xl font-bold text-white mb-6">
-                Available Modules
-              </h3>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {availableModules.map((module) => (
-                  <div
-                    key={module.id}
-                    className={`bg-white/[0.03] backdrop-blur-xl rounded-2xl border p-6 transition-all ${
-                      module.available
-                        ? 'border-white/20 hover:border-white/30 hover:bg-white/[0.05] cursor-pointer'
-                        : 'border-white/10 opacity-60'
-                    }`}
-                  >
-                    <div className="flex items-start justify-between mb-4">
-                      <div className="text-4xl">{module.icon}</div>
-                      {module.available ? (
-                        <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-white text-black">
-                          Available
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center px-3 py-1 rounded-full text-xs font-medium bg-white/10 text-gray-400 border border-white/10">
-                          Coming Soon
-                        </span>
-                      )}
-                    </div>
-                    <h4 className="text-lg font-semibold text-white mb-2">
-                      {module.name}
-                    </h4>
-                    <p className="text-sm text-gray-400">{module.description}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* How It Works */}
-            <div className="bg-white/[0.02] backdrop-blur-xl rounded-2xl border border-white/10 p-8">
-              <h3 className="text-2xl font-bold text-white mb-8 text-center">
-                How It Works
-              </h3>
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-8">
-                <div className="text-center">
-                  <div className="w-16 h-16 bg-white rounded-xl flex items-center justify-center mx-auto mb-4">
-                    <span className="text-2xl font-bold text-black">1</span>
-                  </div>
-                  <h4 className="font-semibold text-white mb-2">Select Modules</h4>
-                  <p className="text-sm text-gray-400">
-                    Choose from pre-built templates and modules
-                  </p>
-                </div>
-                <div className="text-center">
-                  <div className="w-16 h-16 bg-white/10 rounded-xl flex items-center justify-center mx-auto mb-4 border border-white/10">
-                    <span className="text-2xl font-bold text-white">2</span>
-                  </div>
-                  <h4 className="font-semibold text-white mb-2">Configure</h4>
-                  <p className="text-sm text-gray-400">
-                    Set your preferences and backend options
-                  </p>
-                </div>
-                <div className="text-center">
-                  <div className="w-16 h-16 bg-white/10 rounded-xl flex items-center justify-center mx-auto mb-4 border border-white/10">
-                    <span className="text-2xl font-bold text-white">3</span>
-                  </div>
-                  <h4 className="font-semibold text-white mb-2">Generate</h4>
-                  <p className="text-sm text-gray-400">
-                    Get production-ready code instantly
-                  </p>
-                </div>
-                <div className="text-center">
-                  <div className="w-16 h-16 bg-white/10 rounded-xl flex items-center justify-center mx-auto mb-4 border border-white/10">
-                    <span className="text-2xl font-bold text-white">4</span>
-                  </div>
-                  <h4 className="font-semibold text-white mb-2">Deploy</h4>
-                  <p className="text-sm text-gray-400">
-                    Download or push to GitHub instantly
-                  </p>
-                </div>
-              </div>
             </div>
           </div>
-        </div>
+
+          <div className="mb-6 grid gap-4 md:grid-cols-3">
+            <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Total Projects</p>
+              <p className="mt-2 text-3xl font-bold text-slate-900">{projects.length}</p>
+              <p className="mt-2 text-sm text-slate-600 capitalize">
+                Plan: {user?.plan || 'free'}
+              </p>
+            </div>
+            <div className="md:col-span-2">
+              <UsageMeter
+                used={user?.generationsUsed}
+                limit={user?.generationsLimit}
+              />
+            </div>
+          </div>
+
+          {hasReachedLimit && (
+            <div className="mb-6 rounded-2xl border border-amber-200 bg-amber-50 p-4">
+              <h2 className="text-lg font-semibold text-amber-900">
+                You have reached your free generation limit
+              </h2>
+              <p className="mt-1 text-sm text-amber-800">
+                Upgrade to continue building more apps this month.
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button
+                  onClick={() => void handleUpgrade('starter')}
+                  disabled={billingLoading}
+                  className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-60"
+                >
+                  Upgrade to Starter ($19/mo)
+                </button>
+                <button
+                  onClick={() => void handleUpgrade('pro')}
+                  disabled={billingLoading}
+                  className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-100 disabled:opacity-60"
+                >
+                  Upgrade to Pro ($49/mo)
+                </button>
+              </div>
+            </div>
+          )}
+
+          {user?.plan && user.plan !== 'free' && (
+            <div className="mb-6">
+              <button
+                onClick={() => void handleManageBilling()}
+                disabled={billingLoading}
+                className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-60"
+              >
+                Manage Billing
+              </button>
+            </div>
+          )}
+
+          {error && (
+            <p className="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+              {error}
+            </p>
+          )}
+
+          {loadingProjects ? (
+            <div className="rounded-2xl border border-slate-200 bg-white p-6 text-slate-600">
+              Loading projects...
+            </div>
+          ) : sortedProjects.length === 0 ? (
+            <div className="rounded-2xl border border-dashed border-slate-300 bg-white p-10 text-center">
+              <h2 className="text-xl font-semibold text-slate-900">No projects yet</h2>
+              <p className="mt-2 text-sm text-slate-600">
+                Generate your first application to see it here.
+              </p>
+              <Link
+                href="/builder/new"
+                className="mt-5 inline-block rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800"
+              >
+                Create Project
+              </Link>
+            </div>
+          ) : (
+            <div className="grid gap-4 md:grid-cols-2">
+              {sortedProjects.map((project) => (
+                <ProjectCard
+                  key={project.id}
+                  project={project}
+                  onOpen={handleOpen}
+                  onDownload={handleDownload}
+                  onDelete={handleDelete}
+                  actionLoading={actionLoadingId === project.id}
+                />
+              ))}
+            </div>
+          )}
+        </main>
       </div>
-    </div>
+    </ProtectedRoute>
   );
 }

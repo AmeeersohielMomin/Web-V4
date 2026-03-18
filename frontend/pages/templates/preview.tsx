@@ -85,7 +85,7 @@ export default function TemplatePreview() {
       <nav className="relative bg-black/80 backdrop-blur-lg border-b border-white/10">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center h-16">
-            <Link href="/home" className="flex items-center space-x-2">
+            <Link href="/" className="flex items-center space-x-2">
               <div className="w-8 h-8 bg-white rounded-lg flex items-center justify-center">
                 <span className="text-black font-bold text-lg">T</span>
               </div>

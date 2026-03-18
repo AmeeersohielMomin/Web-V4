@@ -2,6 +2,7 @@ import express, { Express, Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import mongoose from 'mongoose';
+import * as Sentry from '@sentry/node';
 
 // Load environment variables FIRST
 dotenv.config();
@@ -28,9 +29,37 @@ if (missingEnvVars.length > 0) {
 
 const app: Express = express();
 const PORT = process.env.PORT || 5000;
+const isSentryEnabled = !!process.env.SENTRY_DSN;
+const allowedOrigins = (
+  process.env.FRONTEND_URL || 'http://localhost:3000,http://127.0.0.1:3000'
+)
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+if (isSentryEnabled) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    environment: process.env.NODE_ENV || 'development',
+    tracesSampleRate: 0.1
+  });
+  console.log('✅ Sentry monitoring enabled');
+}
 
 // Middleware
-app.use(cors());
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(new Error('Not allowed by CORS'));
+    },
+    credentials: true
+  })
+);
+app.use('/api/platform/billing/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -69,6 +98,27 @@ async function startServer() {
       console.log('✅ AI generation module enabled');
     }
 
+    // Platform auth routes (always enabled)
+    const platformAuthRoutes = (await import(
+      './modules/platform-auth/platform-auth.routes'
+    )).default;
+    app.use('/api/platform/auth', platformAuthRoutes);
+    console.log('✅ Platform auth routes enabled');
+
+    const platformProjectsRoutes = (await import(
+      './modules/platform-projects/platform-projects.routes'
+    )).default;
+    app.use('/api/platform/projects', platformProjectsRoutes);
+    console.log('✅ Platform project routes enabled');
+
+    const billingRoutes = (await import('./modules/billing/billing.routes')).default;
+    app.use('/api/platform/billing', billingRoutes);
+    console.log('✅ Platform billing routes enabled');
+
+    const deployRoutes = (await import('./modules/deploy/deploy.routes')).default;
+    app.use('/api/deploy', deployRoutes);
+    console.log('✅ Deployment routes enabled');
+
     // 404 handler
     app.use((req: Request, res: Response) => {
       res.status(404).json({
@@ -81,6 +131,11 @@ async function startServer() {
     // Error handler
     app.use((err: any, req: Request, res: Response, next: any) => {
       console.error('Error:', err);
+
+      if (isSentryEnabled) {
+        Sentry.captureException(err);
+      }
+
       res.status(500).json({
         success: false,
         data: null,

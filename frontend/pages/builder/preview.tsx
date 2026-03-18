@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/router';
-import { authService } from '@/templates/auth/services/auth.service';
+import api, { API_BASE_URL } from '@/lib/api';
+import { getToken } from '@/lib/auth';
 
 export default function Preview() {
   const router = useRouter();
@@ -36,16 +37,20 @@ export default function Preview() {
 
   useEffect(() => {
     const checkAuth = async () => {
-      const token = authService.getToken();
+      const token = getToken();
       if (!token) {
         router.push('/login');
         return;
       }
 
       try {
-        const response = await authService.me(token);
-        if (response.success && response.data?.user) {
-          setUser(response.data.user);
+        const response = await api.get('/api/platform/auth/me');
+        const platformUser = response.data?.data?.user;
+        if (platformUser) {
+          setUser({
+            id: String(platformUser.id || platformUser._id || ''),
+            email: String(platformUser.email || '')
+          });
         } else {
           router.push('/login');
         }
@@ -64,8 +69,7 @@ export default function Preview() {
     setGenerating(true);
     
     try {
-      const token = authService.getToken();
-      const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:5000';
+      const token = getToken();
       
       // Call the generation API
       const response = await fetch(`${API_BASE_URL}/api/project/generate`, {

@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import Anthropic from '@anthropic-ai/sdk';
+import { randomUUID } from 'crypto';
 import { buildFullstackPrompt, buildDesignToCodePrompt, buildRefinePrompt } from './ai.prompts';
 
 export type AIProvider = 'openai' | 'gemini' | 'anthropic' | 'ollama';
@@ -72,7 +73,8 @@ async function generateWithOpenAI(
     model: string,
     systemPrompt: string,
     userMessage: string,
-    onChunk?: (chunk: string) => void
+    onChunk?: (chunk: string) => void,
+    temperature: number = 0.3
 ): Promise<string> {
     const client = new OpenAI({ apiKey });
     const model_name = model || DEFAULT_MODELS.openai;
@@ -85,7 +87,7 @@ async function generateWithOpenAI(
                 { role: 'user', content: userMessage }
             ],
             stream: true,
-            temperature: 0.3,
+            temperature,
             max_tokens: 32768
         });
         let fullResponse = '';
@@ -102,7 +104,7 @@ async function generateWithOpenAI(
                 { role: 'system', content: systemPrompt },
                 { role: 'user', content: userMessage }
             ],
-            temperature: 0.3,
+            temperature,
             max_tokens: 32768
         });
         return response.choices[0]?.message?.content || '';
@@ -115,13 +117,14 @@ async function generateWithGemini(
     model: string,
     systemPrompt: string,
     userMessage: string,
-    onChunk?: (chunk: string) => void
+    onChunk?: (chunk: string) => void,
+    temperature: number = 0.3
 ): Promise<string> {
     const client = new GoogleGenerativeAI(apiKey);
     const generativeModel = client.getGenerativeModel({
         model: model || DEFAULT_MODELS.gemini,
         systemInstruction: systemPrompt,
-        generationConfig: { temperature: 0.3, maxOutputTokens: 65536 }
+        generationConfig: { temperature, maxOutputTokens: 65536 }
     });
 
     try {
@@ -161,7 +164,8 @@ async function generateWithAnthropic(
     model: string,
     systemPrompt: string,
     userMessage: string,
-    onChunk?: (chunk: string) => void
+    onChunk?: (chunk: string) => void,
+    temperature: number = 0.3
 ): Promise<string> {
     const client = new Anthropic({ apiKey });
     const model_name = model || DEFAULT_MODELS.anthropic;
@@ -171,6 +175,7 @@ async function generateWithAnthropic(
             model: model_name,
             max_tokens: 32768,
             system: systemPrompt,
+            temperature,
             messages: [{ role: 'user', content: userMessage }]
         });
         let fullText = '';
@@ -187,6 +192,7 @@ async function generateWithAnthropic(
             model: model_name,
             max_tokens: 32768,
             system: systemPrompt,
+            temperature,
             messages: [{ role: 'user', content: userMessage }]
         });
         const block = response.content[0];
@@ -199,7 +205,8 @@ async function generateWithOllama(
     model: string,
     systemPrompt: string,
     userMessage: string,
-    onChunk?: (chunk: string) => void
+    onChunk?: (chunk: string) => void,
+    temperature: number = 0.3
 ): Promise<string> {
     const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
     const modelName = model || DEFAULT_MODELS.ollama;
@@ -214,7 +221,7 @@ async function generateWithOllama(
                 { role: 'user', content: userMessage }
             ],
             stream: !!onChunk,
-            options: { temperature: 0.3 }
+            options: { temperature }
         })
     });
 
@@ -258,18 +265,20 @@ export class AIService {
         const model = provider === 'gemini'
             ? safeGeminiModel(req.model, isUsingPlatformKey)
             : (req.model || DEFAULT_MODELS[provider]);
+        const generationSeed = randomUUID().slice(0, 8);
         const systemPrompt = `You are an expert full-stack developer for the IDEA platform.`;
-        const fullPrompt = buildFullstackPrompt(userPrompt, selectedModules);
+        const fullPrompt = buildFullstackPrompt(userPrompt, selectedModules, generationSeed);
+        const generationTemperature = 0.38;
 
         switch (provider) {
             case 'openai':
-                return generateWithOpenAI(apiKey, model, systemPrompt, fullPrompt, onChunk);
+                return generateWithOpenAI(apiKey, model, systemPrompt, fullPrompt, onChunk, generationTemperature);
             case 'gemini':
-                return generateWithGemini(apiKey, model, systemPrompt, fullPrompt, onChunk);
+                return generateWithGemini(apiKey, model, systemPrompt, fullPrompt, onChunk, generationTemperature);
             case 'anthropic':
-                return generateWithAnthropic(apiKey, model, systemPrompt, fullPrompt, onChunk);
+                return generateWithAnthropic(apiKey, model, systemPrompt, fullPrompt, onChunk, generationTemperature);
             case 'ollama':
-                return generateWithOllama(model || DEFAULT_MODELS.ollama, systemPrompt, fullPrompt, onChunk);
+                return generateWithOllama(model || DEFAULT_MODELS.ollama, systemPrompt, fullPrompt, onChunk, generationTemperature);
             default:
                 throw new Error(`Unsupported AI provider: ${provider}`);
         }

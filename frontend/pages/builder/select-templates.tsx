@@ -1,95 +1,85 @@
-import { useState, useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/router';
 import Link from 'next/link';
+import Navbar from '@/components/Navbar';
+import ProtectedRoute from '@/components/ProtectedRoute';
+import { useAuth } from '@/contexts/AuthContext';
 
 interface TemplateVariant {
   id: string;
   name: string;
   description: string;
-  preview: string;
   style: string;
   features: string[];
-  gradient: string;
-  color: string;
 }
 
 interface ModuleTemplates {
   [key: string]: TemplateVariant[];
 }
 
+const availableTemplates: ModuleTemplates = {
+  auth: [
+    {
+      id: 'minimal',
+      name: 'Minimal',
+      description: 'Clean and simple authentication forms with minimal styling',
+      style: 'Simple and clean',
+      features: ['Lightweight', 'Mobile-first', 'Easy to customize']
+    },
+    {
+      id: 'modern',
+      name: 'Modern',
+      description: 'Contemporary layout with richer visual hierarchy',
+      style: 'Contemporary UI',
+      features: ['Strong visual polish', 'Smooth interactions', 'Premium look']
+    },
+    {
+      id: 'classic',
+      name: 'Classic',
+      description: 'Traditional enterprise-friendly design',
+      style: 'Professional and structured',
+      features: ['Formal layout', 'Accessibility focused', 'Trusted look']
+    }
+  ],
+  blog: [
+    {
+      id: 'magazine',
+      name: 'Magazine',
+      description: 'Publication style with featured article flow',
+      style: 'Editorial grid',
+      features: ['Hero posts', 'Category filters', 'SEO-oriented structure']
+    }
+  ]
+};
+
 export default function SelectTemplates() {
   const router = useRouter();
+  const { user, logout } = useAuth();
+
   const [projectData, setProjectData] = useState<any>(null);
   const [selectedTemplates, setSelectedTemplates] = useState<{ [key: string]: string }>({});
-  const [previewModule, setPreviewModule] = useState<string | null>(null);
 
   useEffect(() => {
     const saved = localStorage.getItem('builderProject');
-    if (saved) {
-      const data = JSON.parse(saved);
-      if (!data.modules || data.modules.length === 0) {
-        router.push('/builder/select-modules');
-        return;
-      }
-      setProjectData(data);
-      
-      // Set default templates
-      const defaults: { [key: string]: string } = {};
-      data.modules.forEach((module: string) => {
-        defaults[module] = availableTemplates[module]?.[0]?.id || '';
-      });
-      setSelectedTemplates(defaults);
-    } else {
-      router.push('/builder/new');
+    if (!saved) {
+      void router.push('/builder/new');
+      return;
     }
-  }, []);
 
-  const availableTemplates: ModuleTemplates = {
-    auth: [
-      {
-        id: 'minimal',
-        name: 'Minimal',
-        description: 'Clean and simple authentication forms with minimal styling',
-        preview: '📄',
-        style: 'Clean, White, Simple',
-        gradient: 'from-gray-100 to-gray-200',
-        color: 'gray',
-        features: ['Lightweight', 'Fast loading', 'Easy to customize', 'Mobile-first']
-      },
-      {
-        id: 'modern',
-        name: 'Modern',
-        description: 'Contemporary design with gradients and smooth animations',
-        preview: '🎨',
-        style: 'Gradient, Animated, Glassmorphism',
-        gradient: 'from-purple-400 via-pink-500 to-red-500',
-        color: 'purple',
-        features: ['Eye-catching', 'Smooth transitions', 'Modern UI', 'Dark mode ready']
-      },
-      {
-        id: 'classic',
-        name: 'Classic',
-        description: 'Traditional professional design with enterprise feel',
-        preview: '💼',
-        style: 'Professional, Corporate, Structured',
-        gradient: 'from-blue-500 to-indigo-600',
-        color: 'blue',
-        features: ['Enterprise-ready', 'Formal design', 'Accessibility focused', 'Trusted look']
-      }
-    ],
-    blog: [
-      {
-        id: 'magazine',
-        name: 'Magazine',
-        description: 'Publication-style layout with featured articles',
-        preview: '📰',
-        style: 'Grid, Featured, Editorial',
-        gradient: 'from-orange-400 to-red-500',
-        color: 'orange',
-        features: ['Hero posts', 'Category filters', 'Rich media', 'SEO optimized']
-      }
-    ]
-  };
+    const data = JSON.parse(saved);
+    if (!data.modules || data.modules.length === 0) {
+      void router.push('/builder/select-modules');
+      return;
+    }
+
+    setProjectData(data);
+
+    const defaults: { [key: string]: string } = {};
+    data.modules.forEach((moduleId: string) => {
+      defaults[moduleId] = availableTemplates[moduleId]?.[0]?.id || '';
+    });
+    setSelectedTemplates(defaults);
+  }, [router]);
 
   const handleTemplateSelect = (moduleId: string, templateId: string) => {
     setSelectedTemplates({
@@ -99,178 +89,108 @@ export default function SelectTemplates() {
   };
 
   const handleNext = () => {
-    if (!projectData) return;
-    
+    if (!projectData) {
+      return;
+    }
+
     const data = { ...projectData, templates: selectedTemplates };
     localStorage.setItem('builderProject', JSON.stringify(data));
-    router.push('/builder/select-backend');
+    void router.push('/builder/select-backend');
   };
 
-  const handleBack = () => {
-    router.push('/builder/select-modules');
-  };
-
-  if (!projectData) return null;
+  if (!projectData) {
+    return null;
+  }
 
   return (
-    <div className="min-h-screen bg-black text-white">
-      {/* Animated Grid Background */}
-      <div className="fixed inset-0 bg-[linear-gradient(to_right,#ffffff08_1px,transparent_1px),linear-gradient(to_bottom,#ffffff08_1px,transparent_1px)] bg-[size:4rem_4rem] [mask-image:radial-gradient(ellipse_80%_50%_at_50%_0%,#000,transparent)]" />
-      
-      {/* Top Navigation */}
-      <div className="relative border-b border-white/5">
-        <div className="max-w-7xl mx-auto px-6 py-4">
-          <div className="flex items-center justify-between">
-            <button
-              onClick={() => router.push('/builder/select-modules')}
-              className="flex items-center space-x-2 text-gray-400 hover:text-white transition-colors group"
-            >
-              <svg className="w-4 h-4 group-hover:-translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 19l-7-7m0 0l7-7m-7 7h18" />
-              </svg>
-              <span className="text-sm font-medium">Back</span>
-            </button>
-            <div className="flex items-center space-x-3">
-              <span className="text-sm font-medium text-white">{projectData?.projectName}</span>
-            </div>
-          </div>
-        </div>
-      </div>
+    <ProtectedRoute>
+      <div className="min-h-screen bg-slate-50">
+        {user && <Navbar user={user} onLogout={logout} />}
 
-      {/* Compact Progress Indicator */}
-      <div className="relative border-b border-white/5">
-        <div className="max-w-7xl mx-auto px-6 py-4">
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-sm font-medium text-gray-500">Step 3 of 5</span>
-            <span className="text-sm font-medium text-purple-400">Choose Design</span>
-          </div>
-          <div className="relative h-1.5 bg-white/5 rounded-full overflow-hidden">
-            <div className="absolute inset-y-0 left-0 bg-gradient-to-r from-blue-500 via-violet-500 to-purple-500 rounded-full transition-all duration-700 ease-out" style={{ width: '60%' }} />
-          </div>
-        </div>
-      </div>
+        <main className="mx-auto max-w-6xl px-4 py-8 sm:px-6">
+          <button
+            onClick={() => void router.push('/builder/select-modules')}
+            className="mb-4 text-sm font-medium text-slate-600 hover:text-slate-900"
+          >
+            Back
+          </button>
 
-      <div className="relative max-w-7xl mx-auto px-6 py-16">
-        {/* Header */}
-        <div className="text-center mb-12">
-          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-gradient-to-br from-purple-500/10 to-pink-500/10 border border-purple-500/20 mb-6">
-            <svg className="w-7 h-7 text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zm0 0h12a2 2 0 002-2v-4a2 2 0 00-2-2h-2.343M11 7.343l1.657-1.657a2 2 0 012.828 0l2.829 2.829a2 2 0 010 2.828l-8.486 8.485M7 17h.01" />
-            </svg>
-          </div>
-          <h1 className="text-4xl font-bold text-white mb-4 tracking-tight">
-            Choose your design style
-          </h1>
-          <p className="text-lg text-gray-400 leading-relaxed max-w-2xl mx-auto">
-            Select a template for each module. All designs are fully<br />customizable after generation.
-          </p>
-        </div>
-
-        {/* Template Selection for Each Module */}
-        {projectData.modules.map((moduleId: string) => {
-          const templates = availableTemplates[moduleId];
-          if (!templates || templates.length === 0) return null;
-
-          return (
-            <div key={moduleId} className="mb-16 last:mb-0">
-              <div className="mb-6 flex items-center justify-center space-x-3">
-                <div className="h-px flex-1 bg-gradient-to-r from-transparent via-white/10 to-transparent" />
-                <h3 className="text-xl font-bold capitalize text-white px-4 py-2 bg-white/5 rounded-xl border border-white/10">
-                  {moduleId}
-                </h3>
-                <div className="h-px flex-1 bg-gradient-to-r from-transparent via-white/10 to-transparent" />
+          <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
+            <div className="mb-7">
+              <div className="mb-3 flex items-center justify-between text-sm">
+                <span className="font-medium text-slate-500">Step 4 of 5</span>
+                <span className="font-semibold text-slate-900">Choose Templates</span>
               </div>
-              
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                {templates.map((template) => (
-                  <button
-                    key={template.id}
-                    onClick={() => handleTemplateSelect(moduleId, template.id)}
-                    className={`relative text-left p-6 rounded-2xl transition-all ${
-                      selectedTemplates[moduleId] === template.id
-                        ? 'bg-white/[0.07] border-2 border-purple-500 shadow-lg shadow-purple-500/20'
-                        : 'bg-white/[0.02] border border-white/10 hover:bg-white/[0.04] hover:border-white/20'
-                    }`}
-                  >
-                    {/* Selection Indicator */}
-                    {selectedTemplates[moduleId] === template.id && (
-                      <div className="absolute top-4 right-4 w-6 h-6 rounded-full bg-purple-500 flex items-center justify-center">
-                        <svg className="w-4 h-4 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
-                        </svg>
-                      </div>
-                    )}
-
-                    {/* Gradient Accent */}
-                    <div className={`h-1 rounded-full mb-6 bg-gradient-to-r ${template.gradient}`} />
-                    
-                    {/* Preview Icon */}
-                    <div className="text-5xl text-center mb-5">
-                      {template.preview}
-                    </div>
-                    
-                    {/* Template Info */}
-                    <div className="text-center mb-4">
-                      <h4 className="font-bold text-lg text-white mb-2">{template.name}</h4>
-                      <span className="inline-block text-xs px-3 py-1 bg-white/10 text-gray-300 rounded-lg">
-                        {template.style}
-                      </span>
-                    </div>
-                    
-                    {/* Description */}
-                    <p className="text-sm text-gray-400 text-center mb-5 leading-relaxed">{template.description}</p>
-                    
-                    {/* Features */}
-                    <div className="space-y-2 mb-5">
-                      {template.features.map((feature, idx) => (
-                        <div key={idx} className="flex items-center space-x-2 text-xs text-gray-300">
-                          <svg className="w-3.5 h-3.5 text-green-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                          </svg>
-                          <span>{feature}</span>
-                        </div>
-                      ))}
-                    </div>
-
-                    {/* Preview Button */}
-                    <Link
-                      href={`/templates/preview?variant=${template.id}`}
-                      target="_blank"
-                      onClick={(e) => e.stopPropagation()}
-                      className="w-full block text-center py-2.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-white text-sm font-medium transition-all"
-                    >
-                      View Preview →
-                    </Link>
-                  </button>
-                ))}
+              <div className="h-2 overflow-hidden rounded-full bg-slate-100">
+                <div className="h-full w-4/5 rounded-full bg-slate-900" />
               </div>
             </div>
-          );
-        })}
 
-        {/* Navigation */}
-        <div className="mt-16 flex flex-col sm:flex-row gap-3">
-          <button
-            onClick={handleBack}
-            className="h-12 px-6 border border-white/10 hover:bg-white/5 text-white font-medium rounded-xl transition-all flex items-center justify-center space-x-2 group"
-          >
-            <svg className="w-4 h-4 group-hover:-translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-            </svg>
-            <span>Back</span>
-          </button>
-          
-          <button
-            onClick={handleNext}
-            className="flex-1 h-12 bg-gradient-to-r from-blue-500 to-violet-500 hover:from-blue-600 hover:to-violet-600 text-white font-semibold rounded-xl transition-all flex items-center justify-center space-x-2 group"
-          >
-            <span>Continue</span>
-            <svg className="w-4 h-4 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
-            </svg>
-          </button>
-        </div>
+            <div className="mb-8">
+              <p className="text-xs uppercase tracking-wide text-slate-500">Project</p>
+              <p className="mt-1 text-sm font-semibold text-slate-900">{projectData.projectName}</p>
+              <h1 className="mt-4 text-3xl font-bold text-slate-900">Choose design templates</h1>
+              <p className="mt-2 text-sm text-slate-600">Pick one template variant for each selected module.</p>
+            </div>
+
+            {projectData.modules.map((moduleId: string) => {
+              const templates = availableTemplates[moduleId];
+              if (!templates || templates.length === 0) {
+                return null;
+              }
+
+              return (
+                <div key={moduleId} className="mb-8 last:mb-0">
+                  <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-700">{moduleId}</h2>
+                  <div className="grid gap-4 md:grid-cols-3">
+                    {templates.map((template) => {
+                      const selected = selectedTemplates[moduleId] === template.id;
+
+                      return (
+                        <button
+                          key={template.id}
+                          onClick={() => handleTemplateSelect(moduleId, template.id)}
+                          className={`rounded-xl border p-4 text-left transition ${
+                            selected
+                              ? 'border-slate-900 bg-slate-50'
+                              : 'border-slate-200 hover:border-slate-400 hover:bg-slate-50'
+                          }`}
+                        >
+                          <h3 className="text-sm font-semibold text-slate-900">{template.name}</h3>
+                          <p className="mt-1 text-xs text-slate-600">{template.style}</p>
+                          <p className="mt-2 text-sm text-slate-600">{template.description}</p>
+                          <ul className="mt-3 space-y-1 text-xs text-slate-600">
+                            {template.features.map((feature) => (
+                              <li key={feature}>{feature}</li>
+                            ))}
+                          </ul>
+                          <Link
+                            href={`/templates/preview?variant=${template.id}`}
+                            target="_blank"
+                            onClick={(e) => e.stopPropagation()}
+                            className="mt-3 inline-block text-xs font-medium text-sky-700 hover:text-sky-800"
+                          >
+                            Open preview
+                          </Link>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+
+            <div className="mt-8 flex justify-end">
+              <button
+                onClick={handleNext}
+                className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-800"
+              >
+                Continue
+              </button>
+            </div>
+          </section>
+        </main>
       </div>
-    </div>
+    </ProtectedRoute>
   );
 }

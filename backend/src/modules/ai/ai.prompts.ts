@@ -517,10 +517,40 @@ function buildDesignDNA(seed: string): string {
   ].join('\n');
 }
 
-export function buildFullstackPrompt(userDescription: string, selectedModules: string[], variationSeed: string): string {
+export function buildFullstackPrompt(
+  userDescription: string,
+  selectedModules: string[],
+  variationSeed: string,
+  requirements?: RequirementsDocument
+): string {
   const designDNA = buildDesignDNA(variationSeed);
+  const requirementsBlock = requirements ? `
+=== PROJECT REQUIREMENTS (compiled from user interview) ===
+Application type: ${requirements.appType}
+Target users: ${requirements.targetUsers}
+Scale: ${requirements.scale}
+Theme mode: ${requirements.themeMode}
+Design preference: ${requirements.designPreference}
 
-  return `${SYSTEM_PROMPT_FULLSTACK}
+Core features - ALL of these must be implemented:
+${requirements.coreFeatures.map(f => `- ${f}`).join('\n')}
+
+Technology preferences: ${requirements.techPreferences}
+Additional notes: ${requirements.additionalNotes}
+
+User's own words (use these for naming, copy, and UX tone):
+${requirements.answers.map(a => `- "${a.answer}"`).join('\n')}
+
+CRITICAL RULES WHEN REQUIREMENTS ARE PRESENT:
+1. Every feature in the list above must appear in the generated code.
+2. Do not add features not listed.
+3. The theme mode must match exactly. Do not default to dark if "light" is specified.
+4. The design preference takes priority over the Design DNA section below.
+=== END OF PROJECT REQUIREMENTS ===
+
+` : '';
+
+  return requirementsBlock + `${SYSTEM_PROMPT_FULLSTACK}
 
 USER REQUEST:
 "${userDescription}"
@@ -611,4 +641,100 @@ REFINEMENT REQUEST:
 
 Apply the requested changes and return the updated complete JSON output (same format as before).
 CRITICAL: Return ONLY the raw JSON object. No markdown, no code fences, no explanations. Start with { and end with }.`;
+}
+
+// ─── APPEND BELOW ALL EXISTING CODE ───────────────────────────────────────
+
+import type { RequirementsAnswer, RequirementsDocument } from './ai.types';
+
+export function buildRequirementsQuestionsPrompt(
+  userIdea: string,
+  selectedModules: string[]
+): string {
+  return `You are a senior product engineer conducting a requirements interview before building a web application.
+
+A user described their idea:
+"${userIdea}"
+
+Selected modules: ${selectedModules.join(', ') || 'auth (default)'}
+
+Your job: Generate exactly 3 to 5 targeted questions that will gather the most important information needed to build this app correctly. Do not ask generic questions. Every question must be specific to THIS type of application based on the idea described.
+
+Question categories (use only the most relevant):
+- "users": who will use this app and why
+- "features": which specific features are must-have vs nice-to-have
+- "design": visual style, theme mode (light/dark), brand feel
+- "technical": specific technology choices (payment provider, database, etc.)
+- "scope": personal project vs real business launch
+
+Rules:
+1. Return ONLY valid JSON. No explanation, no markdown fences, no preamble.
+2. "projectName" must be lowercase letters and hyphens only, max 30 chars.
+3. "appType" must be exactly one of: "e-commerce", "blog", "dashboard", "social", "saas", "portfolio", "auth", "analytics", "booking", "marketplace", "other".
+4. Each question must be conversational - not a form label.
+5. "hint" is a short example answer shown as placeholder text to guide the user.
+6. Minimum 3 questions, maximum 5. No more.
+7. At least 3 questions must have required: true.
+
+Return ONLY this JSON structure and nothing else:
+{
+  "appType": "string",
+  "projectName": "string",
+  "questions": [
+    {
+      "id": "q1",
+      "question": "conversational question text",
+      "hint": "example answer",
+      "category": "users",
+      "required": true
+    }
+  ]
+}`;
+}
+
+
+export function buildRequirementsCompilePrompt(
+  originalPrompt: string,
+  projectName: string,
+  answers: RequirementsAnswer[],
+  selectedModules: string[]
+): string {
+  const answersText = answers
+    .map(a => `Q: ${a.question}\nA: ${a.answer}`)
+    .join('\n\n');
+
+  return `You are a senior software architect. Compile a structured requirements document from a user interview.
+
+Original idea: "${originalPrompt}"
+Project name: ${projectName}
+Selected modules: ${selectedModules.join(', ')}
+
+User answers:
+${answersText}
+
+Rules:
+1. Return ONLY valid JSON. No explanation, no markdown fences, no preamble.
+2. "coreFeatures" must be an array of concrete feature strings, maximum 8 items.
+3. "themeMode" must be exactly one of: "light", "dark", "hybrid", "any".
+4. "scale" must be exactly one of: "personal", "startup", "enterprise".
+5. "compiledSummary" must be 2-4 plain English sentences. Must start with "You're building".
+6. Infer reasonable values for any field not explicitly answered. Do not leave fields empty.
+7. "techPreferences" is a single string summarising technology choices mentioned.
+8. "designPreference" is a single string describing the visual style.
+
+Return ONLY this JSON structure and nothing else:
+{
+  "originalPrompt": "string",
+  "projectName": "string",
+  "appType": "string",
+  "targetUsers": "string",
+  "coreFeatures": ["string"],
+  "designPreference": "string",
+  "themeMode": "light | dark | hybrid | any",
+  "scale": "personal | startup | enterprise",
+  "techPreferences": "string",
+  "additionalNotes": "string",
+  "answers": ${JSON.stringify(answers)},
+  "compiledSummary": "string"
+}`;
 }

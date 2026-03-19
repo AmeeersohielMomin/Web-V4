@@ -11,7 +11,7 @@ export default function Navbar({ user, onLogout }: NavbarProps) {
     <header className="border-b border-slate-200 bg-white/90 backdrop-blur">
       <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-6">
         <div className="flex items-center gap-8">
-          <Link href="/dashboard" className="text-lg font-bold text-slate-900">
+          <Link href="/" className="text-lg font-bold text-slate-900">
             IDEA Platform
           </Link>
           <nav className="hidden items-center gap-5 text-sm text-slate-600 sm:flex">

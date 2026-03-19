@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { aiService, AIProvider } from './ai.service';
+import type { RequirementsDocument } from './ai.types';
 import { platformProjectsService } from '../platform-projects/platform-projects.service';
 import { platformAuthService } from '../platform-auth/platform-auth.service';
 
@@ -27,19 +28,61 @@ function normalizeGeneratedFiles(files: any[]): GeneratedFile[] {
         });
 }
 
+function buildRawCandidates(raw: string): string[] {
+    const candidates: string[] = [];
+    const trimmed = String(raw || '').trim();
+    if (!trimmed) return candidates;
+
+    const pushUnique = (value: string) => {
+        const v = String(value || '').trim();
+        if (!v) return;
+        if (!candidates.includes(v)) candidates.push(v);
+    };
+
+    pushUnique(trimmed);
+
+    // Extract markdown fenced payload when present.
+    const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fenceMatch?.[1]) pushUnique(fenceMatch[1]);
+
+    // If model returned a JSON string payload, parse once to unwrap.
+    if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+        try {
+            const unwrapped = JSON.parse(trimmed);
+            if (typeof unwrapped === 'string') pushUnique(unwrapped);
+        } catch {}
+    }
+
+    // Try decoding common escaped JSON patterns.
+    if (trimmed.includes('\\"') || trimmed.includes('\\n')) {
+        const decoded = trimmed
+            .replace(/\\n/g, '\n')
+            .replace(/\\t/g, '\t')
+            .replace(/\\"/g, '"');
+        pushUnique(decoded);
+    }
+
+    return candidates;
+}
+
 // ─── Extract JSON from AI response (strip code fences, find JSON) ───
 function extractProjectJSON(raw: string): any {
-    try { return JSON.parse(raw.trim()); } catch {}
-    const firstBrace = raw.indexOf('{');
-    const lastBrace = raw.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace > firstBrace) {
-        try { return JSON.parse(raw.substring(firstBrace, lastBrace + 1)); } catch {}
+    for (const candidate of buildRawCandidates(raw)) {
+        try { return JSON.parse(candidate.trim()); } catch {}
+
+        const firstBrace = candidate.indexOf('{');
+        const lastBrace = candidate.lastIndexOf('}');
+        if (firstBrace !== -1 && lastBrace > firstBrace) {
+            try { return JSON.parse(candidate.substring(firstBrace, lastBrace + 1)); } catch {}
+        }
+
+        // Try fixing trailing commas
+        if (firstBrace !== -1 && lastBrace > firstBrace) {
+            const cleaned = candidate.substring(firstBrace, lastBrace + 1).replace(/,\s*([}\]])/g, '$1');
+            try { return JSON.parse(cleaned); } catch {}
+        }
     }
-    // Try fixing trailing commas
-    if (firstBrace !== -1 && lastBrace > firstBrace) {
-        const cleaned = raw.substring(firstBrace, lastBrace + 1).replace(/,\s*([}\]])/g, '$1');
-        try { return JSON.parse(cleaned); } catch {}
-    }
+
     return null;
 }
 
@@ -49,17 +92,18 @@ function extractFilesFromResponse(raw: string): { files: any[], projectName: str
     const files: any[] = [];
     let projectName = 'My Project';
     let description = '';
+    const candidateRaw = buildRawCandidates(raw)[0] || raw;
 
     // Extract projectName
-    const nameMatch = raw.match(/"projectName"\s*:\s*"([^"]+)"/);
+    const nameMatch = candidateRaw.match(/"projectName"\s*:\s*"([^"]+)"/);
     if (nameMatch) projectName = nameMatch[1];
 
     // Extract description
-    const descMatch = raw.match(/"description"\s*:\s*"([^"]*(?:\\.[^"]*)*)"/);
+    const descMatch = candidateRaw.match(/"description"\s*:\s*"([^"]*(?:\\.[^"]*)*)"/);
     if (descMatch) description = descMatch[1];
 
     // Strategy 1: Try full JSON parse first
-    const fullParsed = extractProjectJSON(raw);
+    const fullParsed = extractProjectJSON(candidateRaw);
     if (fullParsed && fullParsed.files && fullParsed.files.length > 0) {
         return {
             files: normalizeGeneratedFiles(fullParsed.files),
@@ -73,12 +117,12 @@ function extractFilesFromResponse(raw: string): { files: any[], projectName: str
     // We find each "path": "..." and then extract the complete file object
     const pathRegex = /"path"\s*:\s*"([^"]+)"/g;
     let match;
-    while ((match = pathRegex.exec(raw)) !== null) {
+    while ((match = pathRegex.exec(candidateRaw)) !== null) {
         const filePath = match[1];
         const startSearchPos = match.index;
 
         // Find content and language for this file by looking ahead from this position
-        const afterPath = raw.substring(startSearchPos);
+        const afterPath = candidateRaw.substring(startSearchPos);
         
         // Match the content field — this handles escaped quotes and newlines inside the string
         const contentMatch = afterPath.match(/"content"\s*:\s*"((?:[^"\\]|\\.)*)"/);
@@ -179,10 +223,79 @@ function evaluateAuthUiQuality(files: any[]): { pass: boolean; reasons: string[]
     return { pass: reasons.length === 0, reasons };
 }
 
+/**
+ * Checks that all features listed in requirements.coreFeatures
+ * appear somewhere in the generated code. Uses keyword matching.
+ * Returns the list of features that appear to be missing.
+ */
+function checkRequirementsCompliance(
+    files: Array<{ path: string; content: string }>,
+    requirements: RequirementsDocument | undefined
+): { passed: boolean; missing: string[] } {
+    if (!requirements || !requirements.coreFeatures || requirements.coreFeatures.length === 0) {
+        return { passed: true, missing: [] };
+    }
+
+    // Combine all generated code into one searchable string
+    const allCode = files.map(f => (f.content || '')).join('\n').toLowerCase();
+    const missing: string[] = [];
+
+    // Keyword map: if a feature description contains the key,
+    // check for presence of at least one of the mapped keywords in the code
+    const featureKeywords: Record<string, string[]> = {
+        'stripe': ['stripe', 'payment_intent', 'createpaymentintent'],
+        'paypal': ['paypal', '@paypal'],
+        'razorpay': ['razorpay'],
+        'admin': ['admin', 'isadmin', 'role', 'adminrouter', 'adminpanel'],
+        'email': ['nodemailer', 'resend', 'sendgrid', 'smtp', 'mailer'],
+        'dark mode': ['dark', 'prefers-color-scheme', 'darkmode', 'dark:'],
+        'search': ['search', '.filter(', 'query', 'searchbar', 'searchinput'],
+        'pagination': ['page', 'limit', 'offset', 'paginate', 'currentpage'],
+        'file upload': ['multer', 'upload', 'formdata', 's3', 'cloudinary'],
+        'password reset': ['resetpassword', 'forgotpassword', 'reset_token', 'passwordreset'],
+        'oauth': ['oauth', 'passport', 'google', 'github', 'social login'],
+        'websocket': ['socket.io', 'ws', 'websocket', 'socket'],
+        'cart': ['cart', 'basket', 'addtocart', 'cartitem'],
+        'checkout': ['checkout', 'order', 'purchase'],
+        'dashboard': ['dashboard', 'analytics', 'stats', 'metrics'],
+        'notification': ['notification', 'alert', 'toast', 'notify'],
+        'comment': ['comment', 'reply', 'discussion'],
+        'rating': ['rating', 'review', 'star', 'score']
+    };
+
+    for (const feature of requirements.coreFeatures) {
+        const fl = feature.toLowerCase();
+        let found = false;
+
+        // Direct word match — check if the first significant word of the feature appears
+        const firstWord = fl.split(' ').find(w => w.length > 3);
+        if (firstWord && allCode.includes(firstWord)) {
+            found = true;
+        }
+
+        // Keyword map match
+        if (!found) {
+            for (const [key, keywords] of Object.entries(featureKeywords)) {
+                if (fl.includes(key)) {
+                    found = keywords.some(kw => allCode.includes(kw));
+                    if (found) break;
+                }
+            }
+        }
+
+        if (!found) {
+            missing.push(feature);
+        }
+    }
+
+    return { passed: missing.length === 0, missing };
+}
+
 export class AIController {
     // POST /api/ai/generate — Natural language → full-stack code (SSE streaming)
     async generate(req: Request, res: Response): Promise<void> {
-        const { provider, apiKey, model, userPrompt, selectedModules, projectName } = req.body;
+        const { provider, apiKey, model, userPrompt, selectedModules, projectName, requirements } = req.body;
+        const typedRequirements: RequirementsDocument | undefined = requirements || undefined;
 
         if (!provider || !userPrompt) {
             res.status(400).json({ success: false, data: null, error: 'provider and userPrompt are required' });
@@ -211,7 +324,15 @@ export class AIController {
 
             let fullResponse = '';
             await aiService.generate(
-                { provider, apiKey, model, userPrompt, selectedModules: selectedModules || ['auth'], projectName },
+                {
+                    provider,
+                    apiKey,
+                    model,
+                    userPrompt,
+                    selectedModules: selectedModules || ['auth'],
+                    projectName,
+                    requirements: typedRequirements
+                },
                 (chunk: string) => {
                     fullResponse += chunk;
                     sendEvent('chunk', { text: chunk });
@@ -241,7 +362,8 @@ export class AIController {
                         model,
                         userPrompt: retryPrompt,
                         selectedModules: selectedModules || ['auth'],
-                        projectName
+                        projectName,
+                        requirements: typedRequirements
                     },
                     (chunk: string) => {
                         retryResponse += chunk;
@@ -265,7 +387,50 @@ export class AIController {
                 });
             }
 
-            const normalizedFiles = normalizeGeneratedFiles(extracted.files);
+            let normalizedFiles = normalizeGeneratedFiles(extracted.files);
+
+            // Requirements compliance check (only runs when requirements were provided)
+            if (typedRequirements) {
+                const compliance = checkRequirementsCompliance(normalizedFiles, typedRequirements);
+                if (!compliance.passed && compliance.missing.length > 0) {
+                    sendEvent('quality_retry', {
+                        message: `Regenerating to include missing features: ${compliance.missing.join(', ')}`,
+                        reasons: compliance.missing
+                    });
+
+                    // Build a targeted retry prompt
+                    const retryPrompt = `The previous code generation was missing these required features:\n${compliance.missing.map(f => `- ${f}`).join('\n')}\n\nThese features were explicitly requested by the user. Regenerate the complete application ensuring every feature in this list is fully implemented.`;
+
+                    // Run a second generation pass
+                    let retryResponse = '';
+                    await aiService.generate(
+                        {
+                            provider,
+                            apiKey,
+                            model,
+                            userPrompt: `${userPrompt}\n\n${retryPrompt}`,
+                            selectedModules: selectedModules || ['auth'],
+                            projectName,
+                            requirements: typedRequirements
+                        },
+                        (chunk: string) => {
+                            retryResponse += chunk;
+                        }
+                    );
+
+                    const retryExtracted = extractFilesFromResponse(retryResponse);
+                    const retryFiles = normalizeGeneratedFiles(retryExtracted.files);
+                    if (retryFiles.length > 0) {
+                        extracted = retryExtracted;
+                        normalizedFiles = retryFiles;
+                    }
+
+                    sendEvent('quality_report', {
+                        passed: true,
+                        message: 'Requirements compliance retry complete'
+                    });
+                }
+            }
 
             // Send each file as a separate event
             for (const file of normalizedFiles) {
@@ -434,6 +599,105 @@ export class AIController {
         }
     }
 
+    /**
+     * POST /api/ai/requirements
+     * Analyses the user's idea and returns 3-5 targeted clarifying questions.
+     * Does NOT consume a generation quota.
+     * Uses non-streaming JSON response (not SSE).
+     */
+    getRequirementsQuestions = async (req: Request, res: Response): Promise<void> => {
+        try {
+            const { userIdea, selectedModules, provider, apiKey, model } = req.body;
+
+            if (!userIdea || typeof userIdea !== 'string' || userIdea.trim().length < 5) {
+                res.status(400).json({
+                    success: false,
+                    data: null,
+                    error: 'Please describe your idea in more detail before we ask questions.'
+                });
+                return;
+            }
+
+            const result = await aiService.generateRequirementsQuestions({
+                userIdea: userIdea.trim(),
+                selectedModules: Array.isArray(selectedModules) ? selectedModules : [],
+                provider: provider || 'gemini',
+                apiKey: apiKey || undefined,
+                model: model || undefined
+            });
+
+            res.status(200).json({ success: true, data: result, error: null });
+        } catch (err: any) {
+            console.error('[getRequirementsQuestions]', err.message);
+            const errorMessage = err?.message || 'Failed to generate questions. Please try again.';
+            const lower = String(errorMessage).toLowerCase();
+            const isProviderLimitError =
+                lower.includes('provider limits') ||
+                lower.includes('quota') ||
+                lower.includes('rate limit') ||
+                lower.includes('too many requests') ||
+                lower.includes('resource_exhausted');
+
+            if (isProviderLimitError) {
+                res.setHeader('Retry-After', '30');
+            }
+
+            res.status(isProviderLimitError ? 429 : 500).json({
+                success: false,
+                data: null,
+                error: errorMessage
+            });
+        }
+    };
+
+    /**
+     * POST /api/ai/requirements/compile
+     * Compiles user answers into a structured RequirementsDocument.
+     * Does NOT consume a generation quota.
+     * Uses non-streaming JSON response (not SSE).
+     */
+    compileRequirements = async (req: Request, res: Response): Promise<void> => {
+        try {
+            const { originalPrompt, projectName, answers, selectedModules, provider, apiKey } = req.body;
+
+            if (!answers || !Array.isArray(answers) || answers.length === 0) {
+                res.status(400).json({
+                    success: false,
+                    data: null,
+                    error: 'No answers provided. Please answer at least the required questions.'
+                });
+                return;
+            }
+
+            if (!originalPrompt || typeof originalPrompt !== 'string') {
+                res.status(400).json({
+                    success: false,
+                    data: null,
+                    error: 'Original prompt is required.'
+                });
+                return;
+            }
+
+            const requirements = await aiService.compileRequirementsDocument({
+                originalPrompt: originalPrompt.trim(),
+                projectName: projectName || 'my-app',
+                answers,
+                selectedModules: Array.isArray(selectedModules) ? selectedModules : [],
+                provider: provider || 'gemini',
+                apiKey: apiKey || undefined
+            });
+
+            res.status(200).json({ success: true, data: { requirements }, error: null });
+        } catch (err: any) {
+            console.error('[compileRequirements]', err.message);
+            res.status(500).json({
+                success: false,
+                data: null,
+                error: err.message || 'Failed to compile requirements. Please try again.'
+            });
+        }
+    };
+
     // GET /api/ai/providers — List available providers and their models
     async getProviders(req: Request, res: Response): Promise<void> {
         res.json({
@@ -445,8 +709,9 @@ export class AIController {
                         name: 'Google Gemini',
                         logo: '✨',
                         models: [
-                            { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', freeTier: true, speed: 'fast', quality: 'high' },
-                            { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro', freeTier: false, speed: 'medium', quality: 'highest' }
+                            { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', freeTier: true, speed: 'fast', quality: 'high' },
+                            { id: 'gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash Lite', freeTier: true, speed: 'fastest', quality: 'good' },
+                            { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', freeTier: false, speed: 'medium', quality: 'highest' }
                         ],
                         requiresKey: false,
                         freeTierAvailable: true,
@@ -458,9 +723,9 @@ export class AIController {
                         name: 'OpenAI GPT',
                         logo: '🤖',
                         models: [
-                            { id: 'gpt-4o', name: 'GPT-4o', freeTier: false, speed: 'medium', quality: 'highest' },
-                            { id: 'gpt-4-turbo', name: 'GPT-4 Turbo', freeTier: false, speed: 'medium', quality: 'highest' },
-                            { id: 'gpt-3.5-turbo', name: 'GPT-3.5 Turbo', freeTier: false, speed: 'fast', quality: 'good' }
+                            { id: 'gpt-4.1', name: 'GPT-4.1', freeTier: false, speed: 'medium', quality: 'highest' },
+                            { id: 'gpt-4.1-mini', name: 'GPT-4.1 Mini', freeTier: false, speed: 'fast', quality: 'high' },
+                            { id: 'gpt-4o', name: 'GPT-4o', freeTier: false, speed: 'fast', quality: 'high' }
                         ],
                         requiresKey: true,
                         freeTierAvailable: false,
@@ -471,8 +736,9 @@ export class AIController {
                         name: 'Anthropic Claude',
                         logo: '🧠',
                         models: [
-                            { id: 'claude-3-5-sonnet-20241022', name: 'Claude 3.5 Sonnet', freeTier: false, speed: 'medium', quality: 'highest' },
-                            { id: 'claude-3-haiku-20240307', name: 'Claude 3 Haiku', freeTier: false, speed: 'fast', quality: 'good' }
+                            { id: 'claude-sonnet-4-20250514', name: 'Claude Sonnet 4', freeTier: false, speed: 'medium', quality: 'highest' },
+                            { id: 'claude-3-7-sonnet-20250219', name: 'Claude 3.7 Sonnet', freeTier: false, speed: 'medium', quality: 'high' },
+                            { id: 'claude-3-5-haiku-20241022', name: 'Claude 3.5 Haiku', freeTier: false, speed: 'fast', quality: 'good' }
                         ],
                         requiresKey: true,
                         freeTierAvailable: false,
@@ -483,9 +749,9 @@ export class AIController {
                         name: 'Ollama (Local)',
                         logo: '🦙',
                         models: [
-                            { id: 'llama3.2', name: 'Llama 3.2', freeTier: true, speed: 'varies', quality: 'good' },
-                            { id: 'codestral', name: 'Codestral', freeTier: true, speed: 'varies', quality: 'good' },
-                            { id: 'deepseek-coder', name: 'DeepSeek Coder', freeTier: true, speed: 'varies', quality: 'good' }
+                            { id: 'llama3.3', name: 'Llama 3.3', freeTier: true, speed: 'varies', quality: 'good' },
+                            { id: 'qwen2.5-coder', name: 'Qwen2.5 Coder', freeTier: true, speed: 'varies', quality: 'good' },
+                            { id: 'deepseek-r1', name: 'DeepSeek R1', freeTier: true, speed: 'varies', quality: 'good' }
                         ],
                         requiresKey: false,
                         freeTierAvailable: true,

@@ -1,10 +1,12 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { useRouter } from 'next/router';
 import api, { API_BASE_URL } from '@/lib/api';
 import { getToken } from '@/lib/auth';
 import Navbar from '@/components/Navbar';
 import ProtectedRoute from '@/components/ProtectedRoute';
 import { useAuth } from '@/contexts/AuthContext';
+import type { RequirementsDocument } from '../../types/generation';
+import { PREVIEW_MSG, type PreviewStack } from '../../lib/previewUtils';
 
 interface GeneratedFile {
     path: string;
@@ -27,6 +29,7 @@ interface ChatHistoryEntry {
     prompt: string;
     createdAt: string;
 }
+
 
 // ─── Robust JSON extractor ───
 function extractJSON(raw: string): GeneratedProject | null {
@@ -121,12 +124,15 @@ export default function AIGenerate() {
     const [error, setError] = useState('');
     const [refinementPrompt, setRefinementPrompt] = useState('');
     const [isRefining, setIsRefining] = useState(false);
+    const [projectRequirements, setProjectRequirements] = useState<RequirementsDocument | null>(null);
     const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
     const [progress, setProgress] = useState(0);
     const streamBoxRef = useRef<HTMLDivElement>(null);
     const projectFinalizedRef = useRef(false);
     const [viewMode, setViewMode] = useState<'code' | 'preview'>('code');
-    const iframeRef = useRef<HTMLIFrameElement>(null);
+    const previewFrameRef = useRef<HTMLIFrameElement | null>(null);
+    const [previewRunnerReady, setPreviewRunnerReady] = useState(false);
+    const [previewStack, setPreviewStack] = useState<PreviewStack>('unknown');
 
     useEffect(() => {
         const init = async () => {
@@ -188,11 +194,26 @@ export default function AIGenerate() {
                 return;
             }
             const data = JSON.parse(saved);
+            const storedRequirements = data?.requirements || null;
+            setProjectRequirements(storedRequirements);
             setProjectData(data);
             if (Array.isArray(data.chatHistory)) {
                 setChatHistory(data.chatHistory);
             }
+
+            const requirementsPrompt = storedRequirements
+                ? [
+                    storedRequirements.compiledSummary,
+                    Array.isArray(storedRequirements.coreFeatures) && storedRequirements.coreFeatures.length > 0
+                        ? `Must-have features:\n${storedRequirements.coreFeatures.map((f: string) => `- ${f}`).join('\n')}`
+                        : '',
+                    storedRequirements.themeMode ? `Theme: ${storedRequirements.themeMode}` : '',
+                    storedRequirements.techPreferences ? `Tech preferences: ${storedRequirements.techPreferences}` : ''
+                ].filter(Boolean).join('\n\n')
+                : '';
+
             setUserPrompt(
+                data.userPrompt || requirementsPrompt ||
                 `Build a ${data.projectName || 'web app'} with ${(data.modules || ['auth']).join(', ')} functionality`
             );
         };
@@ -245,7 +266,8 @@ export default function AIGenerate() {
                 model: projectData.aiModel || 'gemini-2.5-flash',
                 userPrompt: prompt,
                 selectedModules: projectData.modules || ['auth'],
-                projectName: projectData.projectName
+                projectName: projectData.projectName,
+                requirements: projectRequirements ?? undefined
             };
 
         try {
@@ -346,6 +368,34 @@ export default function AIGenerate() {
                                 files: receivedFiles,
                                 projectId: projectMeta.projectId
                             });
+
+                            // Auto-select the best file to preview after generation completes
+                            const selectBestPreviewFile = (files: GeneratedFile[]): string | null => {
+                                // Priority 1: main entry pages
+                                const mainPage = files.find(f =>
+                                    f.path.includes('/login') ||
+                                    f.path.includes('/dashboard') ||
+                                    f.path.includes('/index')
+                                );
+                                if (mainPage) return mainPage.path;
+
+                                // Priority 2: any frontend TSX component
+                                const frontendTsx = files.find(f =>
+                                    f.path.startsWith('frontend/') && f.path.endsWith('.tsx')
+                                );
+                                if (frontendTsx) return frontendTsx.path;
+
+                                // Priority 3: first file
+                                return files[0]?.path || null;
+                            };
+
+                            const bestPreviewPath = selectBestPreviewFile(receivedFiles);
+                            if (bestPreviewPath) {
+                                // Use the same setter that clicking a file in the tree uses
+                                // This triggers the existing postMessage to preview-runner.tsx
+                                setActiveFile(bestPreviewPath);
+                                setViewMode('preview');
+                            }
                         }
                     }
 
@@ -462,57 +512,88 @@ export default function AIGenerate() {
         navigator.clipboard.writeText(text);
     };
 
-    const providerLabel = projectData?.aiProvider === 'openai' ? 'GPT-4o' : projectData?.aiProvider === 'anthropic' ? 'Claude' : 'Gemini';
+    // Persist builder state continuously so refresh/navigation does not lose chats or generated files.
+    useEffect(() => {
+        if (!projectData) return;
+
+        try {
+            const saved = localStorage.getItem('builderProject');
+            const existing = saved ? JSON.parse(saved) : {};
+
+            const next = {
+                ...existing,
+                ...projectData,
+                requirements: projectRequirements ?? existing.requirements,
+                chatHistory,
+                generatedCode: generatedProject ?? existing.generatedCode,
+                projectId: generatedProject?.projectId ?? existing.projectId ?? null,
+                buildPath: 'ai'
+            };
+
+            localStorage.setItem('builderProject', JSON.stringify(next));
+        } catch {
+            // Ignore persistence failures in preview/session flow.
+        }
+    }, [projectData, projectRequirements, generatedProject, chatHistory]);
+
+    const providerLabel = projectData?.aiProvider === 'openai' ? 'OpenAI' : projectData?.aiProvider === 'anthropic' ? 'Claude' : 'Gemini';
 
     const activeFileContent = generatedProject?.files.find(f => f.path === activeFile)?.content || '';
+    const fileTree = generatedProject ? buildFileTree(generatedProject.files) : [];
 
-    // Update preview when code or active file changes
+    const previewEntryPath = useMemo(() => {
+        if (!generatedProject?.files?.length) return null;
+
+        const isRenderable = (path: string) =>
+            path.startsWith('frontend/') && /\.(tsx|ts|jsx|js)$/i.test(path);
+
+        if (activeFile && isRenderable(activeFile)) return activeFile;
+
+        const candidates = generatedProject.files.map((f) => f.path);
+        return (
+            candidates.find((p) => p === 'frontend/src/app/page.tsx') ||
+            candidates.find((p) => p.includes('/app/') && p.endsWith('/page.tsx')) ||
+            candidates.find((p) => p === 'frontend/src/pages/index.tsx') ||
+            candidates.find((p) => p.endsWith('/App.tsx')) ||
+            candidates.find((p) => p.endsWith('/app.tsx')) ||
+            candidates.find((p) => isRenderable(p)) ||
+            null
+        );
+    }, [generatedProject, activeFile]);
+
     useEffect(() => {
-        if (viewMode !== 'preview' || !iframeRef.current || !activeFileContent || !activeFile) return;
+        const handlePreviewRunnerMessage = (event: MessageEvent) => {
+            if (event?.data?.type === PREVIEW_MSG.READY || event?.data?.type === 'PREVIEW_READY') {
+                setPreviewRunnerReady(true);
+            }
 
-        // Only preview frontend files (tsx/jsx/html)
-        const isFrontend =
-            activeFile.includes('frontend') &&
-            (activeFile.endsWith('.tsx') || activeFile.endsWith('.jsx') || activeFile.endsWith('.html'));
+            if (event.data?.type === PREVIEW_MSG.STACK_DETECTED) {
+                setPreviewStack(event.data.stack as PreviewStack);
+            }
+        };
 
-        if (!isFrontend) return;
+        window.addEventListener('message', handlePreviewRunnerMessage);
+        return () => window.removeEventListener('message', handlePreviewRunnerMessage);
+    }, []);
 
-        iframeRef.current.contentWindow?.postMessage(
+    useEffect(() => {
+        if (!previewRunnerReady || !generatedProject || !previewEntryPath || !previewFrameRef.current?.contentWindow) {
+            return;
+        }
+
+        const entryFile = generatedProject.files.find((f) => f.path === previewEntryPath);
+        if (!entryFile) return;
+
+        previewFrameRef.current.contentWindow.postMessage(
             {
                 type: 'UPDATE_PREVIEW',
-                code: activeFileContent,
-                files: generatedProject?.files || [],
-                filePath: activeFile
+                code: entryFile.content,
+                filePath: previewEntryPath,
+                files: generatedProject.files.map((f) => ({ path: f.path, content: f.content }))
             },
             '*'
         );
-    }, [viewMode, activeFile, activeFileContent, generatedProject]);
-
-    // Listen for messages from preview runner
-    useEffect(() => {
-        const handleMessage = (event: MessageEvent) => {
-            if (event.data?.type !== 'PREVIEW_READY' || !activeFileContent || !activeFile) return;
-
-            const isFrontend =
-                activeFile.includes('frontend') &&
-                (activeFile.endsWith('.tsx') || activeFile.endsWith('.jsx') || activeFile.endsWith('.html'));
-
-            if (!isFrontend) return;
-
-            iframeRef.current?.contentWindow?.postMessage(
-                {
-                    type: 'UPDATE_PREVIEW',
-                    code: activeFileContent,
-                    files: generatedProject?.files || [],
-                    filePath: activeFile
-                },
-                '*'
-            );
-        };
-        window.addEventListener('message', handleMessage);
-        return () => window.removeEventListener('message', handleMessage);
-    }, [activeFileContent, activeFile, generatedProject]);
-    const fileTree = generatedProject ? buildFileTree(generatedProject.files) : [];
+    }, [previewRunnerReady, generatedProject, previewEntryPath]);
 
     // ─── Render file tree recursively ───
     const renderTreeNode = (node: TreeNode, depth: number = 0) => {
@@ -777,13 +858,54 @@ export default function AIGenerate() {
 
                                         {/* Preview View (Pre-warmed) */}
                                         <div className={`h-full w-full bg-white relative ${viewMode === 'preview' ? 'block' : 'absolute inset-0 pointer-events-none opacity-0'}`}>
-                                            <iframe
-                                                ref={iframeRef}
-                                                src="/builder/preview-runner"
-                                                className="w-full h-full border-none"
-                                                title="Live Preview"
-                                            />
-                                            {viewMode === 'preview' && !activeFileContent && (
+                                            {previewEntryPath ? (
+                                                <div className="h-full w-full flex flex-col">
+                                                    <div className="border-b border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-700 flex items-center justify-between">
+                                                        <div className="truncate">
+                                                            <span className="font-semibold">Preview Diagnostics</span>
+                                                            <span className="mx-2 text-slate-400">|</span>
+                                                            <span>Entry: <span className="font-mono">{previewEntryPath}</span></span>
+                                                        </div>
+                                                        <div className="flex items-center gap-2 text-[10px]">
+                                                            <span className="rounded bg-emerald-50 px-2 py-0.5 text-emerald-700 border border-emerald-200">
+                                                                mapped {generatedProject.files.filter((f) => f.path.startsWith('frontend/')).length}
+                                                            </span>
+                                                            {previewStack !== 'unknown' && (
+                                                                <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                                                                    previewStack === 'vue'        ? 'bg-green-100 text-green-700' :
+                                                                    previewStack === 'nextjs'     ? 'bg-black text-white' :
+                                                                    previewStack === 'react-vite' ? 'bg-blue-100 text-blue-700' :
+                                                                    previewStack === 'html'       ? 'bg-orange-100 text-orange-700' :
+                                                                    'bg-gray-100 text-gray-600'
+                                                                }`}>
+                                                                    {previewStack === 'vue'        && '⬡ Vue 3'}
+                                                                    {previewStack === 'nextjs'     && '▲ Next.js'}
+                                                                    {previewStack === 'react-vite' && '⚡ React+Vite'}
+                                                                    {previewStack === 'html'       && '◇ HTML'}
+                                                                </span>
+                                                            )}
+                                                            <span className="rounded bg-amber-50 px-2 py-0.5 text-amber-700 border border-amber-200">
+                                                                local runner
+                                                            </span>
+                                                        </div>
+                                                    </div>
+                                                    <div className="flex-1 overflow-hidden">
+                                                        <iframe
+                                                            ref={previewFrameRef}
+                                                            src="/builder/preview-runner"
+                                                            className="h-full w-full border-0"
+                                                            sandbox="allow-scripts allow-same-origin allow-forms"
+                                                            onLoad={() => setPreviewRunnerReady(false)}
+                                                            title="Local Preview Runner"
+                                                        />
+                                                    </div>
+                                                </div>
+                                            ) : (
+                                                <div className="h-full w-full flex items-center justify-center text-slate-500 text-sm">
+                                                    No previewable frontend entry found in generated files.
+                                                </div>
+                                            )}
+                                            {viewMode === 'preview' && !activeFileContent && !previewEntryPath && (
                                                 <div className="absolute inset-0 flex items-center justify-center text-slate-500 text-sm bg-white/80">
                                                     Preparing preview...
                                                 </div>

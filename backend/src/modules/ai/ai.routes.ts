@@ -49,4 +49,20 @@ router.post(
 router.post('/design-to-code', freeTierLimiter, (req, res) => aiController.designToCode(req, res));
 router.post('/refine', freeTierLimiter, optionalAuth, (req, res) => aiController.refine(req, res));
 
+// Requirements gathering routes — these do NOT consume generation quota
+// freeTierLimiter and optionalAuth are already imported in this file
+router.post(
+    '/requirements',
+    freeTierLimiter,
+    optionalAuth,
+    aiController.getRequirementsQuestions
+);
+
+router.post(
+    '/requirements/compile',
+    freeTierLimiter,
+    optionalAuth,
+    aiController.compileRequirements
+);
+
 export { router as aiRoutes };

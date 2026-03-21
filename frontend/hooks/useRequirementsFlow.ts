@@ -30,6 +30,8 @@ interface UseRequirementsFlowReturn {
   projectName: string;
   loading: boolean;
   error: string | null;
+  errorStatus: number | null;
+  retryAfter: string | null;
   clearError: () => void;
   askQuestions: () => Promise<void>;
   compileRequirements: () => Promise<void>;
@@ -78,12 +80,18 @@ export function useRequirementsFlow(
   const [projectName, setProjectName] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [errorStatus, setErrorStatus] = useState<number | null>(null);
+  const [retryAfter, setRetryAfter] = useState<string | null>(null);
 
   const setAnswer = (questionId: string, value: string) => {
     setAnswers(prev => ({ ...prev, [questionId]: value }));
   };
 
-  const clearError = () => setError(null);
+  const clearError = () => {
+    setError(null);
+    setErrorStatus(null);
+    setRetryAfter(null);
+  };
 
   /**
    * Call POST /api/ai/requirements with the user's idea.
@@ -93,9 +101,13 @@ export function useRequirementsFlow(
   const askQuestions = async (): Promise<void> => {
     if (userIdea.trim().length < 10) {
       setError('Please describe your idea in a bit more detail - at least a sentence.');
+      setErrorStatus(null);
+      setRetryAfter(null);
       return;
     }
     setError(null);
+    setErrorStatus(null);
+    setRetryAfter(null);
     setPhase('questioning');
     setLoading(true);
 
@@ -121,6 +133,12 @@ export function useRequirementsFlow(
     } catch (err: any) {
       const msg = err?.response?.data?.error || 'Failed to generate questions. Please try again.';
       setError(msg);
+      setErrorStatus(typeof err?.response?.status === 'number' ? err.response.status : null);
+      setRetryAfter(
+        err?.response?.headers?.['retry-after']
+          ? String(err.response.headers['retry-after'])
+          : null
+      );
       setPhase('idle');
     } finally {
       setLoading(false);
@@ -158,7 +176,8 @@ export function useRequirementsFlow(
         answers: answersArray,
         selectedModules: params.selectedModules,
         provider: params.provider,
-        apiKey: params.apiKey || undefined
+        apiKey: params.apiKey || undefined,
+        model: params.model || undefined
       });
 
       setRequirements(data.data.requirements as RequirementsDocument);
@@ -213,6 +232,8 @@ export function useRequirementsFlow(
     requirements,
     projectName,
     loading,
+    errorStatus,
+    retryAfter,
     error, clearError,
     askQuestions,
     compileRequirements,

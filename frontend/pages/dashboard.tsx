@@ -18,6 +18,8 @@ function mapProject(raw: any): DashboardProject {
     status: String(raw.status || 'complete'),
     fileCount: Number(raw.fileCount || 0),
     updatedAt: String(raw.updatedAt || new Date().toISOString()),
+    isPublic: !!raw.isPublic,
+    tags: Array.isArray(raw.tags) ? raw.tags : [],
     vercelDeployUrl: raw.vercelDeployUrl ? String(raw.vercelDeployUrl) : undefined,
     githubRepoUrl: raw.githubRepoUrl ? String(raw.githubRepoUrl) : undefined,
     railwayServiceUrl: raw.railwayServiceUrl ? String(raw.railwayServiceUrl) : undefined
@@ -103,6 +105,20 @@ export default function DashboardPage() {
     }
   };
 
+  const handlePublish = async (project: DashboardProject) => {
+    setActionLoadingId(project.id);
+    try {
+      await api.patch(`/api/platform/projects/${project.id}/public`, { isPublic: !project.isPublic });
+      setProjects((current) =>
+        current.map((p) => p.id === project.id ? { ...p, isPublic: !p.isPublic } : p)
+      );
+    } catch (err: any) {
+      setError(err?.response?.data?.error || 'Failed to toggle publish status');
+    } finally {
+      setActionLoadingId(null);
+    }
+  };
+
   const handleUpgrade = async (planId: 'starter' | 'pro') => {
     setBillingLoading(true);
     setError('');
@@ -174,7 +190,16 @@ export default function DashboardPage() {
                 Plan: {user?.plan || 'free'}
               </p>
             </div>
-            <div className="md:col-span-2">
+            {user?.teamId && (
+              <div className="rounded-2xl border border-violet-200 bg-violet-50 p-5 shadow-sm">
+                <p className="text-xs uppercase tracking-wide text-violet-600">Team</p>
+                <p className="mt-2 text-lg font-bold text-violet-900">Collaborative workspace</p>
+                <Link href="/team" className="mt-2 inline-block text-sm text-violet-700 hover:text-violet-900 font-medium">
+                  Manage team →
+                </Link>
+              </div>
+            )}
+            <div className={user?.teamId ? '' : 'md:col-span-2'}>
               <UsageMeter
                 used={user?.generationsUsed}
                 limit={user?.generationsLimit}
@@ -253,6 +278,7 @@ export default function DashboardPage() {
                   onOpen={handleOpen}
                   onDownload={handleDownload}
                   onDelete={handleDelete}
+                  onPublish={handlePublish}
                   actionLoading={actionLoadingId === project.id}
                 />
               ))}

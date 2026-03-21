@@ -10,6 +10,7 @@ export default function SignupPage() {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
@@ -24,8 +25,14 @@ export default function SignupPage() {
     setError('');
     setSubmitting(true);
 
+    if (password !== confirmPassword) {
+      setError('Password and confirm password must match.');
+      setSubmitting(false);
+      return;
+    }
+
     try {
-      await register(name, email, password);
+      await register(name, email, password, confirmPassword);
       await router.push('/builder/new');
     } catch (err: any) {
       if (err?.code === 'ERR_NETWORK') {
@@ -77,6 +84,18 @@ export default function SignupPage() {
               minLength={8}
               className="w-full rounded-lg border border-slate-300 px-3 py-2 text-slate-900 outline-none transition focus:border-slate-500"
               placeholder="At least 8 characters"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-sm font-medium text-slate-700">Confirm Password</label>
+            <input
+              type="password"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
+              required
+              minLength={8}
+              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-slate-900 outline-none transition focus:border-slate-500"
+              placeholder="Re-enter your password"
             />
           </div>
 

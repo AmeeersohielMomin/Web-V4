@@ -49,14 +49,14 @@ const plans = [
     price: '$19/mo',
     limit: '50 apps/mo',
     cta: 'Start free trial',
-    href: '/pricing'
+    href: '/signup'
   },
   {
     name: 'Pro',
     price: '$49/mo',
     limit: 'Unlimited',
     cta: 'Start free trial',
-    href: '/pricing'
+    href: '/signup'
   }
 ];
 

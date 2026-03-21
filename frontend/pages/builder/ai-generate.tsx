@@ -5,6 +5,9 @@ import { getToken } from '@/lib/auth';
 import Navbar from '@/components/Navbar';
 import ProtectedRoute from '@/components/ProtectedRoute';
 import { useAuth } from '@/contexts/AuthContext';
+import VersionHistory from '@/components/VersionHistory';
+import DeviceFrame from '@/components/DeviceFrame';
+import { generateDockerfile, generateDockerCompose, generateGitHubActions, generateTestFile } from '@/lib/exportUtils';
 import type { RequirementsDocument } from '../../types/generation';
 import { PREVIEW_MSG, type PreviewStack } from '../../lib/previewUtils';
 
@@ -134,6 +137,21 @@ export default function AIGenerate() {
     const [previewRunnerReady, setPreviewRunnerReady] = useState(false);
     const [previewStack, setPreviewStack] = useState<PreviewStack>('unknown');
 
+    // ─── New feature state ───
+    const [chatPanelOpen, setChatPanelOpen] = useState(true);
+    const [chatMessages, setChatMessages] = useState<Array<{ role: 'user' | 'assistant'; content: string; timestamp: Date }>>([]); 
+    const [chatInput, setChatInput] = useState('');
+    const [chatLoading, setChatLoading] = useState(false);
+    const chatEndRef = useRef<HTMLDivElement>(null);
+    const [showExportMenu, setShowExportMenu] = useState(false);
+    const [isPublished, setIsPublished] = useState(false);
+    const [showInviteModal, setShowInviteModal] = useState(false);
+    const [inviteEmail, setInviteEmail] = useState('');
+    const [inviteRole, setInviteRole] = useState<'editor' | 'viewer'>('editor');
+    const [inviting, setInviting] = useState(false);
+    const [inviteMsg, setInviteMsg] = useState('');
+    const [deviceMode, setDeviceMode] = useState<'desktop' | 'tablet' | 'mobile'>('desktop');
+
     useEffect(() => {
         const init = async () => {
             if (!router.isReady) {
@@ -256,7 +274,7 @@ export default function AIGenerate() {
                 provider: projectData.aiProvider || 'gemini',
                 apiKey: projectData.aiApiKey || undefined,
                 model: projectData.aiModel || 'gemini-2.5-flash',
-                previousCode: streamedText,
+                previousCode: generatedProject?.files?.map(f => ({ path: f.path, content: f.content })) || [],
                 refinementRequest: prompt,
                 projectId: generatedProject?.projectId || null
             }
@@ -428,17 +446,48 @@ export default function AIGenerate() {
 
             // Final fallback: if no files from server, try client-side parsing
             if (!projectFinalizedRef.current && receivedFiles.length === 0 && fullText.trim()) {
+                console.warn('[ai-generate] No files from server SSE. Attempting client-side JSON extraction...');
+                console.log('[ai-generate] fullText length:', fullText.length);
                 const parsed = extractJSON(fullText);
                 if (parsed && parsed.files && parsed.files.length > 0) {
+                    console.log('[ai-generate] Client-side JSON parse succeeded:', parsed.files.length, 'files');
                     projectFinalizedRef.current = true;
                     finalizeProject(parsed);
                 } else {
-                    // Absolute last resort — shouldn't happen with new server-side parsing
-                    finalizeProject({
-                        projectName: projectData?.projectName || 'My App',
-                        description: prompt,
-                        files: [{ path: 'generated-output.txt', content: fullText, language: 'text' }]
-                    });
+                    // Try regex-based file extraction for truncated JSON
+                    console.warn('[ai-generate] JSON.parse failed. Trying regex file extraction...');
+                    const regexFiles: GeneratedFile[] = [];
+                    const filePattern = /\{\s*"path"\s*:\s*"([^"]+)"\s*,\s*"content"\s*:\s*"((?:[^"\\]|\\.)*)"\s*(?:,\s*"language"\s*:\s*"([^"]*)")?\s*\}/g;
+                    let match;
+                    while ((match = filePattern.exec(fullText)) !== null) {
+                        try {
+                            regexFiles.push({
+                                path: match[1],
+                                content: JSON.parse(`"${match[2]}"`),
+                                language: match[3] || 'text'
+                            });
+                        } catch { /* skip malformed */ }
+                    }
+
+                    if (regexFiles.length > 0) {
+                        console.log('[ai-generate] Regex extraction found', regexFiles.length, 'files');
+                        // Try to get projectName from the text
+                        const nameMatch = fullText.match(/"projectName"\s*:\s*"([^"]+)"/);
+                        const descMatch = fullText.match(/"description"\s*:\s*"([^"]+)"/);
+                        projectFinalizedRef.current = true;
+                        finalizeProject({
+                            projectName: nameMatch?.[1] || projectData?.projectName || 'My App',
+                            description: descMatch?.[1] || prompt,
+                            files: regexFiles
+                        });
+                    } else {
+                        console.warn('[ai-generate] All extraction methods failed. Saving as raw text.');
+                        finalizeProject({
+                            projectName: projectData?.projectName || 'My App',
+                            description: prompt,
+                            files: [{ path: 'generated-output.txt', content: fullText, language: 'text' }]
+                        });
+                    }
                 }
             }
         } catch (err: any) {
@@ -510,6 +559,82 @@ export default function AIGenerate() {
 
     const copyToClipboard = (text: string) => {
         navigator.clipboard.writeText(text);
+    };
+
+    // ─── Chat panel handlers ───
+    useEffect(() => {
+        chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }, [chatMessages]);
+
+    const handleChatSend = async () => {
+        if (!chatInput.trim() || chatLoading || !generatedProject) return;
+        const msg = chatInput.trim();
+        setChatInput('');
+        setChatMessages(prev => [...prev, { role: 'user', content: msg, timestamp: new Date() }]);
+        setChatLoading(true);
+
+        // Use the existing refine flow
+        setChatHistory(current => [...current, { type: 'refine', prompt: msg, createdAt: new Date().toISOString() }]);
+        await generate(msg, true);
+
+        setChatMessages(prev => [...prev, { role: 'assistant', content: '✅ Code updated based on your request.', timestamp: new Date() }]);
+        setChatLoading(false);
+    };
+
+    // ─── Export handlers ───
+    const downloadTextFile = (content: string, filename: string) => {
+        const blob = new Blob([content], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        setShowExportMenu(false);
+    };
+
+    const handleExportDocker = () => {
+        const files = generatedProject?.files?.map(f => ({ path: f.path, content: f.content })) || [];
+        downloadTextFile(generateDockerfile(files), 'Dockerfile');
+    };
+
+    const handleExportCompose = () => {
+        downloadTextFile(generateDockerCompose(projectData?.projectName || 'app'), 'docker-compose.yml');
+    };
+
+    const handleExportCICD = () => {
+        downloadTextFile(generateGitHubActions(projectData?.projectName || 'app'), 'ci.yml');
+    };
+
+    const handleExportTests = () => {
+        downloadTextFile(generateTestFile(projectData?.projectName || 'app'), 'app.test.ts');
+    };
+
+    // ─── Publish toggle ───
+    const handlePublishToggle = async () => {
+        if (!generatedProject?.projectId) return;
+        try {
+            await api.patch(`/api/platform/projects/${generatedProject.projectId}/public`, { isPublic: !isPublished });
+            setIsPublished(!isPublished);
+        } catch { /* silently fail */ }
+    };
+
+    // ─── Invite handler ───
+    const handleInvite = async () => {
+        if (!inviteEmail.trim()) return;
+        setInviting(true);
+        setInviteMsg('');
+        try {
+            await api.post('/api/platform/teams/invite', { email: inviteEmail.trim(), role: inviteRole });
+            setInviteMsg('Invite sent!');
+            setInviteEmail('');
+        } catch (err: any) {
+            setInviteMsg(err?.response?.data?.error || 'Failed to send invite');
+        } finally {
+            setInviting(false);
+        }
     };
 
     // Persist builder state continuously so refresh/navigation does not lose chats or generated files.
@@ -662,12 +787,72 @@ export default function AIGenerate() {
                     <div className="flex items-center space-x-2">
                         {generatedProject && (
                             <>
+                                {/* Team avatar + Invite */}
+                                {user?.teamId && (
+                                    <div className="flex items-center mr-1">
+                                        <div className="w-6 h-6 rounded-full bg-violet-100 text-violet-700 flex items-center justify-center text-[10px] font-bold border border-violet-200">
+                                            {user?.name?.charAt(0)?.toUpperCase() || 'U'}
+                                        </div>
+                                    </div>
+                                )}
+                                <button
+                                    onClick={() => setShowInviteModal(!showInviteModal)}
+                                    className="text-xs px-2.5 py-1.5 border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-100 transition-all"
+                                >
+                                    👥 Invite
+                                </button>
+
+                                {/* Publish toggle */}
+                                {generatedProject.projectId && (
+                                    <button
+                                        onClick={() => void handlePublishToggle()}
+                                        className={`text-xs px-2.5 py-1.5 rounded-lg font-medium transition-all ${
+                                            isPublished
+                                                ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                                : 'border border-slate-300 text-slate-700 hover:bg-slate-100'
+                                        }`}
+                                    >
+                                        {isPublished ? '📢 Published' : '📢 Publish'}
+                                    </button>
+                                )}
+
+                                {/* Export dropdown */}
+                                <div className="relative">
+                                    <button
+                                        onClick={() => setShowExportMenu(!showExportMenu)}
+                                        className="text-xs px-2.5 py-1.5 border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-100 transition-all"
+                                    >
+                                        📦 Export ▾
+                                    </button>
+                                    {showExportMenu && (
+                                        <div className="absolute right-0 top-full mt-1 w-52 bg-white border border-slate-200 rounded-xl shadow-lg py-1 z-50">
+                                            <button onClick={handleExportDocker} className="w-full text-left px-3 py-2 text-xs text-slate-700 hover:bg-slate-50">🐳 Dockerfile</button>
+                                            <button onClick={handleExportCompose} className="w-full text-left px-3 py-2 text-xs text-slate-700 hover:bg-slate-50">🐳 Docker Compose</button>
+                                            <button onClick={handleExportCICD} className="w-full text-left px-3 py-2 text-xs text-slate-700 hover:bg-slate-50">🔄 GitHub Actions CI/CD</button>
+                                            <button onClick={handleExportTests} className="w-full text-left px-3 py-2 text-xs text-slate-700 hover:bg-slate-50">🧪 Test File</button>
+                                        </div>
+                                    )}
+                                </div>
+
                                 <button
                                     onClick={() => { setGeneratedProject(null); setStreamedText(''); setActiveFile(null); }}
                                     className="text-xs px-3 py-1.5 border border-slate-300 rounded-lg text-slate-700 hover:bg-slate-100 transition-all"
                                 >
                                     ↻ Regenerate
                                 </button>
+
+                                {/* Chat panel toggle */}
+                                <button
+                                    onClick={() => setChatPanelOpen(!chatPanelOpen)}
+                                    className={`text-xs px-2.5 py-1.5 rounded-lg transition-all ${
+                                        chatPanelOpen
+                                            ? 'bg-slate-900 text-white'
+                                            : 'border border-slate-300 text-slate-700 hover:bg-slate-100'
+                                    }`}
+                                >
+                                    💬 Chat
+                                </button>
+
                                 <button
                                     onClick={handleDeploy}
                                     className="text-xs px-4 py-1.5 bg-slate-900 text-white rounded-lg font-semibold hover:bg-slate-800 transition-all flex items-center space-x-1"
@@ -686,6 +871,39 @@ export default function AIGenerate() {
                     </div>
                 )}
             </div>
+
+            {/* Invite Modal */}
+            {showInviteModal && (
+                <div className="absolute top-14 right-4 z-50 w-80 bg-white border border-slate-200 rounded-xl shadow-xl p-4">
+                    <div className="flex items-center justify-between mb-3">
+                        <h3 className="text-sm font-semibold text-slate-900">Invite Team Member</h3>
+                        <button onClick={() => setShowInviteModal(false)} className="text-slate-400 hover:text-slate-700 text-xs">✕</button>
+                    </div>
+                    <input
+                        type="email"
+                        value={inviteEmail}
+                        onChange={(e) => setInviteEmail(e.target.value)}
+                        placeholder="teammate@email.com"
+                        className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-900 mb-2 focus:outline-none focus:border-slate-500"
+                    />
+                    <select
+                        value={inviteRole}
+                        onChange={(e) => setInviteRole(e.target.value as 'editor' | 'viewer')}
+                        className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm text-slate-800 mb-3 focus:outline-none"
+                    >
+                        <option value="editor">Editor — can edit code</option>
+                        <option value="viewer">Viewer — read only</option>
+                    </select>
+                    <button
+                        onClick={() => void handleInvite()}
+                        disabled={inviting || !inviteEmail.trim()}
+                        className="w-full py-2 bg-slate-900 text-white text-sm font-semibold rounded-lg hover:bg-slate-800 disabled:opacity-40"
+                    >
+                        {inviting ? 'Sending...' : 'Send Invite'}
+                    </button>
+                    {inviteMsg && <p className="text-xs mt-2 text-emerald-600">{inviteMsg}</p>}
+                </div>
+            )}
 
             {/* Main Content */}
             <div className="relative flex-1 flex flex-col overflow-hidden">
@@ -798,6 +1016,18 @@ export default function AIGenerate() {
                             <div className="border-t border-slate-200 px-3 py-2">
                                 <p className="text-[10px] text-slate-500 truncate">{generatedProject.description?.substring(0, 60)}</p>
                             </div>
+
+                            {/* Version History */}
+                            {generatedProject.projectId && (
+                                <div className="border-t border-slate-200">
+                                    <div className="px-3 py-2 bg-slate-50">
+                                        <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-600 mb-1">Version History</p>
+                                    </div>
+                                    <div className="max-h-40 overflow-auto">
+                                        <VersionHistory projectId={generatedProject.projectId} />
+                                    </div>
+                                </div>
+                            )}
                         </div>
 
                         {/* Code Panel */}
@@ -921,58 +1151,90 @@ export default function AIGenerate() {
                                     </div>
                                 </div>
                             )}
+                        </div>
 
-                            {chatHistory.length > 0 && (
-                                <div className="border-t border-slate-200 px-3 py-2.5 max-h-44 overflow-auto bg-slate-50">
-                                    <p className="mb-2 text-[11px] font-semibold uppercase tracking-wide text-slate-700">
-                                        Saved Chat History
-                                    </p>
-                                    <div className="space-y-1.5">
-                                        {chatHistory.map((entry, index) => (
-                                            <div
-                                                key={`${entry.createdAt}-${index}`}
-                                                className="rounded-lg border border-slate-200 bg-white px-2.5 py-1.5"
-                                            >
-                                                <div className="mb-1 flex items-center justify-between gap-2">
-                                                    <span className={`text-[10px] font-semibold uppercase tracking-wide ${entry.type === 'refine' ? 'text-emerald-700' : 'text-sky-700'}`}>
-                                                        {entry.type === 'refine' ? 'Refine' : 'Generate'}
+                        {/* ─── Right Panel: AI Chat ─── */}
+                        {chatPanelOpen && (
+                            <div className="w-80 flex-shrink-0 border-l border-slate-200 flex flex-col bg-white">
+                                {/* Chat header */}
+                                <div className="px-3 py-2.5 border-b border-slate-200 flex items-center justify-between">
+                                    <div className="flex items-center space-x-2">
+                                        <span className="text-xs font-semibold text-slate-900">💬 AI Chat</span>
+                                        <span className="text-[10px] px-1.5 py-0.5 bg-emerald-50 text-emerald-700 rounded border border-emerald-200 font-medium">
+                                            {chatMessages.length + chatHistory.length} messages
+                                        </span>
+                                    </div>
+                                    <button onClick={() => setChatPanelOpen(false)} className="text-slate-400 hover:text-slate-700 text-xs">✕</button>
+                                </div>
+
+                                {/* Chat messages */}
+                                <div className="flex-1 overflow-auto p-3 space-y-3">
+                                    {/* Show saved chat history first */}
+                                    {chatHistory.map((entry, index) => (
+                                        <div key={`hist-${index}`} className={`flex ${entry.type === 'refine' ? 'justify-start' : 'justify-end'}`}>
+                                            <div className={`max-w-[90%] rounded-xl px-3 py-2 text-xs ${entry.type === 'refine' ? 'bg-slate-100 text-slate-700' : 'bg-sky-50 text-sky-800 border border-sky-100'}`}>
+                                                <div className="flex items-center gap-1.5 mb-1">
+                                                    <span className={`text-[9px] font-bold uppercase ${entry.type === 'refine' ? 'text-emerald-600' : 'text-sky-600'}`}>
+                                                        {entry.type === 'refine' ? '✨ Refine' : '🔨 Generate'}
                                                     </span>
-                                                    <span className="text-[10px] text-slate-500">
-                                                        {new Date(entry.createdAt).toLocaleString()}
-                                                    </span>
+                                                    <span className="text-[9px] text-slate-400">{new Date(entry.createdAt).toLocaleTimeString()}</span>
                                                 </div>
-                                                <p className="line-clamp-2 text-xs text-slate-700">{entry.prompt}</p>
+                                                <p className="leading-relaxed">{entry.prompt}</p>
                                             </div>
-                                        ))}
+                                        </div>
+                                    ))}
+
+                                    {/* Real-time chat messages */}
+                                    {chatMessages.map((msg, i) => (
+                                        <div key={`chat-${i}`} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                                            <div className={`max-w-[90%] rounded-xl px-3 py-2 text-xs ${
+                                                msg.role === 'user'
+                                                    ? 'bg-slate-900 text-white'
+                                                    : 'bg-emerald-50 text-emerald-800 border border-emerald-100'
+                                            }`}>
+                                                <p className="leading-relaxed">{msg.content}</p>
+                                                <p className="text-[9px] opacity-60 mt-1">{msg.timestamp.toLocaleTimeString()}</p>
+                                            </div>
+                                        </div>
+                                    ))}
+
+                                    {/* Loading indicator */}
+                                    {chatLoading && (
+                                        <div className="flex justify-start">
+                                            <div className="bg-slate-100 rounded-xl px-3 py-2 text-xs text-slate-500">
+                                                <div className="flex space-x-1">
+                                                    <div className="w-1.5 h-1.5 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                                                    <div className="w-1.5 h-1.5 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                                                    <div className="w-1.5 h-1.5 bg-slate-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+                                    <div ref={chatEndRef} />
+                                </div>
+
+                                {/* Chat input */}
+                                <div className="border-t border-slate-200 p-3">
+                                    <div className="flex gap-2">
+                                        <input
+                                            type="text"
+                                            value={chatInput}
+                                            onChange={(e) => setChatInput(e.target.value)}
+                                            onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && void handleChatSend()}
+                                            placeholder="Ask AI to refine code..."
+                                            className="flex-1 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-900 placeholder-slate-400 focus:outline-none focus:border-slate-400"
+                                        />
+                                        <button
+                                            onClick={() => void handleChatSend()}
+                                            disabled={chatLoading || !chatInput.trim()}
+                                            className="px-3 py-2 bg-slate-900 text-white rounded-lg text-xs font-medium hover:bg-slate-800 disabled:opacity-30 transition-all"
+                                        >
+                                            ↑
+                                        </button>
                                     </div>
                                 </div>
-                            )}
-
-                            {/* Refinement bar at bottom */}
-                            <div className="border-t border-slate-200 bg-white p-3 flex gap-2 flex-shrink-0">
-                                <input
-                                    type="text"
-                                    value={refinementPrompt}
-                                    onChange={(e) => setRefinementPrompt(e.target.value)}
-                                    onKeyDown={(e) => e.key === 'Enter' && handleRefine()}
-                                    placeholder="Ask AI to refine... e.g. Add dark mode toggle, add Stripe payments..."
-                                    className="flex-1 px-4 py-2.5 bg-white border border-slate-300 rounded-xl text-slate-900 placeholder-slate-400 focus:outline-none focus:border-slate-500 transition-all text-sm"
-                                />
-                                <button
-                                    onClick={handleRefine}
-                                    disabled={isRefining || !refinementPrompt.trim()}
-                                    className="px-4 py-2.5 border border-slate-300 bg-white text-slate-700 font-semibold rounded-xl transition-all disabled:opacity-30 text-sm hover:bg-slate-100"
-                                >
-                                    {isRefining ? '⏳' : '✨'} Refine
-                                </button>
-                                <button
-                                    onClick={handleDeploy}
-                                    className="px-5 py-2.5 bg-slate-900 text-white font-semibold rounded-xl transition-all text-sm hover:bg-slate-800"
-                                >
-                                    🚀 Deploy
-                                </button>
                             </div>
-                        </div>
+                        )}
                     </div>
                 )}
 

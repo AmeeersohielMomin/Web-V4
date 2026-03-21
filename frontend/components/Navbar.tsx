@@ -21,6 +21,17 @@ export default function Navbar({ user, onLogout }: NavbarProps) {
             <Link href="/builder/new" className="hover:text-slate-900">
               New Project
             </Link>
+            <Link href="/templates/gallery" className="hover:text-slate-900">
+              Templates
+            </Link>
+            <Link href="/team" className="hover:text-slate-900">
+              Team
+            </Link>
+            {user.role === 'admin' && (
+              <Link href="/admin" className="text-violet-600 hover:text-violet-800 font-medium">
+                Admin
+              </Link>
+            )}
           </nav>
         </div>
 
@@ -29,6 +40,12 @@ export default function Navbar({ user, onLogout }: NavbarProps) {
             <p className="text-sm font-medium text-slate-900">{user.name || 'Builder'}</p>
             <p className="text-xs text-slate-500">{user.email}</p>
           </div>
+          <Link
+            href="/settings"
+            className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-100"
+          >
+            Settings
+          </Link>
           <button
             onClick={onLogout}
             className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-100"

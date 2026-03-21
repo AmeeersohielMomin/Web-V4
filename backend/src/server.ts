@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import mongoose from 'mongoose';
 import * as Sentry from '@sentry/node';
+import { getCounters } from './utils/telemetry';
 
 // Load environment variables FIRST
 dotenv.config();
@@ -31,7 +32,7 @@ const app: Express = express();
 const PORT = process.env.PORT || 5000;
 const isSentryEnabled = !!process.env.SENTRY_DSN;
 const allowedOrigins = (
-  process.env.FRONTEND_URL || 'http://localhost:3000,http://127.0.0.1:3000'
+  process.env.FRONTEND_URL || 'http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001'
 )
   .split(',')
   .map((origin) => origin.trim())
@@ -65,6 +66,10 @@ app.use(express.urlencoded({ extended: true }));
 
 // Health check
 app.get('/health', (req: Request, res: Response) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+app.get('/api/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
@@ -111,6 +116,13 @@ async function startServer() {
     app.use('/api/platform/projects', platformProjectsRoutes);
     console.log('✅ Platform project routes enabled');
 
+    // Dev-only telemetry endpoint - not exposed in production
+    if (process.env.NODE_ENV !== 'production') {
+      app.get('/api/dev/telemetry', (_req: Request, res: Response) => {
+        res.json({ success: true, data: getCounters(), error: null });
+      });
+    }
+
     const billingRoutes = (await import('./modules/billing/billing.routes')).default;
     app.use('/api/platform/billing', billingRoutes);
     console.log('✅ Platform billing routes enabled');
@@ -118,6 +130,10 @@ async function startServer() {
     const deployRoutes = (await import('./modules/deploy/deploy.routes')).default;
     app.use('/api/deploy', deployRoutes);
     console.log('✅ Deployment routes enabled');
+
+    const teamRoutes = (await import('./modules/teams/team.routes')).default;
+    app.use('/api/platform/teams', teamRoutes);
+    console.log('✅ Team routes enabled');
 
     // 404 handler
     app.use((req: Request, res: Response) => {

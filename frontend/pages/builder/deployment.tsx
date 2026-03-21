@@ -5,6 +5,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import Navbar from '@/components/Navbar';
 import ProtectedRoute from '@/components/ProtectedRoute';
 import JSZip from 'jszip';
+import { generateDockerfile, generateDockerCompose, generateGitHubActions, generateTestFile } from '@/lib/exportUtils';
 
 type DeployStatus = 'idle' | 'building' | 'ready' | 'error';
 
@@ -606,6 +607,62 @@ export default function DeploymentPage() {
                 </a>
               )}
             </article>
+          </section>
+
+          {/* Export Options */}
+          <section className="mt-6 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h3 className="text-lg font-semibold text-slate-900 mb-1">Export Options</h3>
+            <p className="text-sm text-slate-600 mb-4">Generate deployment and infrastructure files for your project.</p>
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <button
+                onClick={() => {
+                  const content = generateDockerfile([]);
+                  const blob = new Blob([content], { type: 'text/plain' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a'); a.href = url; a.download = 'Dockerfile'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+                }}
+                className="rounded-lg border border-slate-300 px-4 py-3 text-sm font-medium text-slate-700 hover:bg-slate-50 transition text-left"
+              >
+                <span className="block text-base mb-0.5">🐳</span>
+                Dockerfile
+              </button>
+              <button
+                onClick={() => {
+                  const content = generateDockerCompose(projectName);
+                  const blob = new Blob([content], { type: 'text/plain' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a'); a.href = url; a.download = 'docker-compose.yml'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+                }}
+                className="rounded-lg border border-slate-300 px-4 py-3 text-sm font-medium text-slate-700 hover:bg-slate-50 transition text-left"
+              >
+                <span className="block text-base mb-0.5">🐳</span>
+                Docker Compose
+              </button>
+              <button
+                onClick={() => {
+                  const content = generateGitHubActions(projectName);
+                  const blob = new Blob([content], { type: 'text/plain' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a'); a.href = url; a.download = 'ci.yml'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+                }}
+                className="rounded-lg border border-slate-300 px-4 py-3 text-sm font-medium text-slate-700 hover:bg-slate-50 transition text-left"
+              >
+                <span className="block text-base mb-0.5">🔄</span>
+                GitHub Actions CI/CD
+              </button>
+              <button
+                onClick={() => {
+                  const content = generateTestFile(projectName);
+                  const blob = new Blob([content], { type: 'text/plain' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a'); a.href = url; a.download = 'app.test.ts'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+                }}
+                className="rounded-lg border border-slate-300 px-4 py-3 text-sm font-medium text-slate-700 hover:bg-slate-50 transition text-left"
+              >
+                <span className="block text-base mb-0.5">🧪</span>
+                Test File
+              </button>
+            </div>
           </section>
         </main>
       </div>

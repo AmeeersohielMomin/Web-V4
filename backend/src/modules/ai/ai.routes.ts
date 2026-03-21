@@ -2,7 +2,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import rateLimit from 'express-rate-limit';
 import { aiController } from './ai.controller';
 import { optionalAuth } from '../../middleware/auth.middleware';
-import { generationLimiter } from '../../middleware/rateLimit.middleware';
+import { generationLimiter, requirementsLimiter } from '../../middleware/rateLimit.middleware';
 import { checkGenerationQuota } from '../../middleware/generationQuota.middleware';
 
 const router = Router();
@@ -53,14 +53,14 @@ router.post('/refine', freeTierLimiter, optionalAuth, (req, res) => aiController
 // freeTierLimiter and optionalAuth are already imported in this file
 router.post(
     '/requirements',
-    freeTierLimiter,
+    requirementsLimiter,
     optionalAuth,
     aiController.getRequirementsQuestions
 );
 
 router.post(
     '/requirements/compile',
-    freeTierLimiter,
+    requirementsLimiter,
     optionalAuth,
     aiController.compileRequirements
 );

@@ -37,6 +37,12 @@ export interface RequirementsDocument {
   additionalNotes: string;
   answers: RequirementsAnswer[];
   compiledSummary: string;
+  _meta?: {
+    source: 'ai' | 'fallback';
+    provider: string;
+    model: string;
+    timestamp: string;
+  };
 }
 
 export interface QuestionsApiResponse {

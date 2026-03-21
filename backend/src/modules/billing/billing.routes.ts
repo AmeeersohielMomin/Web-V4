@@ -5,6 +5,44 @@ import { billingService } from './billing.service';
 
 const router = Router();
 
+router.get('/plans', (_req, res) => {
+  res.json({
+    success: true,
+    data: {
+      plans: [
+        {
+          id: 'free',
+          name: 'Free',
+          price: 0,
+          currency: 'usd',
+          interval: null,
+          generationsLimit: 3,
+          features: ['3 app generations', 'Download as ZIP', 'All templates']
+        },
+        {
+          id: 'starter',
+          name: 'Starter',
+          price: 19,
+          currency: 'usd',
+          interval: 'month',
+          generationsLimit: 50,
+          features: ['50 generations/month', 'Download + Deploy', 'Priority generation']
+        },
+        {
+          id: 'pro',
+          name: 'Pro',
+          price: 49,
+          currency: 'usd',
+          interval: 'month',
+          generationsLimit: -1,
+          features: ['Unlimited generations', 'All deploy options', 'Custom domains', 'Priority support']
+        }
+      ]
+    },
+    error: null
+  });
+});
+
 router.post('/checkout', requireAuth, async (req, res) => {
   try {
     const planId = req.body.planId as PlanId;

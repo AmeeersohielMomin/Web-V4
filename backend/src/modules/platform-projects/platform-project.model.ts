@@ -28,6 +28,18 @@ const chatEntrySchema = new mongoose.Schema(
   { _id: false }
 );
 
+const versionSnapshotSchema = new mongoose.Schema(
+  {
+    versionNumber: { type: Number, required: true },
+    label: { type: String, default: '' },
+    prompt: { type: String, default: '' },
+    files: [generatedFileSchema],
+    fileCount: { type: Number, default: 0 },
+    createdAt: { type: Date, default: Date.now }
+  },
+  { _id: true }
+);
+
 const platformProjectSchema = new mongoose.Schema(
   {
     userId: {
@@ -50,6 +62,10 @@ const platformProjectSchema = new mongoose.Schema(
     chatHistory: [chatEntrySchema],
     files: [generatedFileSchema],
     fileCount: { type: Number, default: 0 },
+    versions: [versionSnapshotSchema],
+    currentVersion: { type: Number, default: 1 },
+    tags: [String],
+    isPublic: { type: Boolean, default: false },
     designSeed: { type: String },
     deployUrl: { type: String },
     githubUrl: { type: String },

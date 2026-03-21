@@ -22,6 +22,10 @@ export interface AuthUser {
   email: string;
   name?: string;
   plan?: string;
+  role?: string;
+  avatar?: string;
+  teamId?: string;
+  teamRole?: string;
   generationsUsed?: number;
   generationsLimit?: number;
 }
@@ -31,7 +35,12 @@ interface AuthContextValue {
   loading: boolean;
   isAuthenticated: boolean;
   login: (email: string, password: string) => Promise<void>;
-  register: (name: string, email: string, password: string) => Promise<void>;
+  register: (
+    name: string,
+    email: string,
+    password: string,
+    confirmPassword?: string
+  ) => Promise<void>;
   logout: () => void;
   refreshUser: () => Promise<void>;
 }
@@ -44,6 +53,10 @@ function normalizeUser(raw: any): AuthUser {
     email: String(raw.email || ''),
     name: raw.name || '',
     plan: raw.plan || 'free',
+    role: raw.role || 'user',
+    avatar: raw.avatar || '',
+    teamId: raw.teamId || undefined,
+    teamRole: raw.teamRole || undefined,
     generationsUsed:
       typeof raw.generationsUsed === 'number' ? raw.generationsUsed : undefined,
     generationsLimit:
@@ -130,11 +143,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const register = useCallback(
-    async (name: string, email: string, password: string) => {
+    async (
+      name: string,
+      email: string,
+      password: string,
+      confirmPassword?: string
+    ) => {
       const response = await api.post('/api/platform/auth/register', {
         name,
         email,
-        password
+        password,
+        confirmPassword: confirmPassword ?? password
       });
       const token = response.data?.data?.token;
       const rawUser = response.data?.data?.user;

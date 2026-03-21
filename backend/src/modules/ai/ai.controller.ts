@@ -3,6 +3,7 @@ import { aiService, AIProvider } from './ai.service';
 import type { RequirementsDocument } from './ai.types';
 import { platformProjectsService } from '../platform-projects/platform-projects.service';
 import { platformAuthService } from '../platform-auth/platform-auth.service';
+import { track } from '../../utils/telemetry';
 
 type GeneratedFile = { path: string; content: string; language?: string };
 
@@ -296,13 +297,14 @@ export class AIController {
     async generate(req: Request, res: Response): Promise<void> {
         const { provider, apiKey, model, userPrompt, selectedModules, projectName, requirements } = req.body;
         const typedRequirements: RequirementsDocument | undefined = requirements || undefined;
+        track('generation.started', { provider: req.body?.provider });
 
         if (!provider || !userPrompt) {
             res.status(400).json({ success: false, data: null, error: 'provider and userPrompt are required' });
             return;
         }
 
-        const validProviders: AIProvider[] = ['openai', 'gemini', 'anthropic', 'ollama'];
+        const validProviders: AIProvider[] = ['openai', 'gemini', 'anthropic', 'ollama', 'nvidia'];
         if (!validProviders.includes(provider)) {
             res.status(400).json({ success: false, data: null, error: `Invalid provider. Must be one of: ${validProviders.join(', ')}` });
             return;
@@ -346,6 +348,7 @@ export class AIController {
             // Permanent quality guard: auto-retry once if auth UI output is below threshold.
             const qualityCheck = evaluateAuthUiQuality(extracted.files);
             if (!qualityCheck.pass) {
+                track('generation.quality_retry');
                 sendEvent('quality_retry', {
                     message: 'Auth UI quality below professional standard. Running automatic visual enhancement.',
                     reasons: qualityCheck.reasons
@@ -393,6 +396,7 @@ export class AIController {
             if (typedRequirements) {
                 const compliance = checkRequirementsCompliance(normalizedFiles, typedRequirements);
                 if (!compliance.passed && compliance.missing.length > 0) {
+                    track('generation.quality_retry');
                     sendEvent('quality_retry', {
                         message: `Regenerating to include missing features: ${compliance.missing.join(', ')}`,
                         reasons: compliance.missing
@@ -457,6 +461,7 @@ export class AIController {
 
                     await platformProjectsService.saveFiles(project._id.toString(), normalizedFiles);
                     projectId = project._id.toString();
+                    track('generation.persisted');
 
                     await platformProjectsService.appendChatEntry(
                         projectId,
@@ -468,6 +473,9 @@ export class AIController {
                     );
                 } catch (persistError: any) {
                     console.error('[AI] Project persistence warning:', persistError?.message || persistError);
+                    track('generation.persist_failed', {
+                        error: persistError?.message || 'unknown'
+                    });
                     sendEvent('warning', {
                         message: 'Generation completed but project history save failed for this run.'
                     });
@@ -484,9 +492,14 @@ export class AIController {
                 tokensUsed: fullResponse.length,
                 projectId
             });
+            track('generation.completed', {
+                provider: req.body?.provider,
+                fileCount: normalizedFiles?.length ?? 0
+            });
             res.end();
         } catch (error: any) {
             console.error('[AI] Generation error:', error.message);
+            track('generation.failed', { error: error?.message || 'unknown' });
             sendEvent('error', { message: error.message || 'Generation failed' });
             res.end();
         }
@@ -628,7 +641,7 @@ export class AIController {
 
             res.status(200).json({ success: true, data: result, error: null });
         } catch (err: any) {
-            console.error('[getRequirementsQuestions]', err.message);
+            console.error('[getRequirementsQuestions]', err.message, err.status || '', err.response?.data || '');
             const errorMessage = err?.message || 'Failed to generate questions. Please try again.';
             const lower = String(errorMessage).toLowerCase();
             const isProviderLimitError =
@@ -658,7 +671,7 @@ export class AIController {
      */
     compileRequirements = async (req: Request, res: Response): Promise<void> => {
         try {
-            const { originalPrompt, projectName, answers, selectedModules, provider, apiKey } = req.body;
+            const { originalPrompt, projectName, answers, selectedModules, provider, apiKey, model } = req.body;
 
             if (!answers || !Array.isArray(answers) || answers.length === 0) {
                 res.status(400).json({
@@ -678,13 +691,30 @@ export class AIController {
                 return;
             }
 
+            const emptyRequired = answers.filter(
+                (a: any) =>
+                    !a?.answer ||
+                    String(a.answer).trim() === '' ||
+                    String(a.answer).trim().toLowerCase() === '(skipped)'
+            );
+
+            if (emptyRequired.length > 0) {
+                res.status(400).json({
+                    success: false,
+                    data: null,
+                    error: `Please answer all questions before compiling. Missing: "${emptyRequired[0]?.question || 'Unknown question'}"`
+                });
+                return;
+            }
+
             const requirements = await aiService.compileRequirementsDocument({
                 originalPrompt: originalPrompt.trim(),
                 projectName: projectName || 'my-app',
                 answers,
                 selectedModules: Array.isArray(selectedModules) ? selectedModules : [],
                 provider: provider || 'gemini',
-                apiKey: apiKey || undefined
+                apiKey: apiKey || undefined,
+                model: model || undefined
             });
 
             res.status(200).json({ success: true, data: { requirements }, error: null });

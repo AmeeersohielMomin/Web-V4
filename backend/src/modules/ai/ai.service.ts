@@ -16,8 +16,9 @@ import type {
     RequirementsDocument,
     QuestionsResponse
 } from './ai.types';
+import { track } from '../../utils/telemetry';
 
-export type AIProvider = 'openai' | 'gemini' | 'anthropic' | 'ollama';
+export type AIProvider = 'openai' | 'gemini' | 'anthropic' | 'ollama' | 'nvidia';
 
 export interface GenerateRequest {
     provider: AIProvider;
@@ -41,7 +42,7 @@ export interface RefineRequest {
     provider: AIProvider;
     apiKey?: string;
     model?: string;
-    previousCode: string;
+    previousCode: Array<{ path: string; content: string }>;
     refinementRequest: string;
 }
 
@@ -50,8 +51,11 @@ const DEFAULT_MODELS: Record<AIProvider, string> = {
     openai: 'gpt-4.1',
     gemini: 'gemini-2.5-flash',   // Most reliable model, works on free-tier API key
     anthropic: 'claude-sonnet-4-20250514',
-    ollama: 'llama3.2'
+    ollama: 'llama3.2',
+    nvidia: 'nvidia/nemotron-3-super-120b-a12b'
 };
+
+const NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1';
 
 const GEMINI_PLATFORM_FALLBACK_MODELS = [
     'gemini-2.5-flash',
@@ -338,6 +342,14 @@ function resolveApiKey(provider: AIProvider, userApiKey?: string): string {
     if (userApiKey && userApiKey.trim()) return userApiKey.trim();
     // Free tier: only platform-managed Gemini is available without user key
     if (provider === 'gemini') return getPlatformGeminiKey();
+    // Ollama runs locally — no API key needed
+    if (provider === 'ollama') return '';
+    // NVIDIA NIM: use platform key from env if no user key provided
+    if (provider === 'nvidia') {
+        const nvidiaKey = process.env.NVIDIA_API_KEY;
+        if (nvidiaKey) return nvidiaKey;
+        throw new Error('An API key is required for NVIDIA NIM. Please provide your NVIDIA API key.');
+    }
     throw new Error(`An API key is required for ${provider}. Please provide your own ${provider} API key.`);
 }
 
@@ -567,6 +579,52 @@ async function generateWithOllama(
     }
 }
 
+// ─── NVIDIA NIM ───────────────────────────────────────────────
+async function generateWithNvidia(
+    apiKey: string,
+    model: string,
+    systemPrompt: string,
+    userMessage: string,
+    onChunk?: (chunk: string) => void,
+    temperature: number = 0.3
+): Promise<string> {
+    const client = new OpenAI({ apiKey, baseURL: NVIDIA_BASE_URL });
+    const modelName = model || DEFAULT_MODELS.nvidia;
+
+    if (onChunk) {
+        const stream = await client.chat.completions.create({
+            model: modelName,
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userMessage }
+            ],
+            stream: true,
+            temperature,
+            top_p: 0.7,
+            max_tokens: 65536
+        });
+        let fullResponse = '';
+        for await (const chunk of stream) {
+            const text = chunk.choices[0]?.delta?.content || '';
+            fullResponse += text;
+            if (text) onChunk(text);
+        }
+        return fullResponse;
+    } else {
+        const response = await client.chat.completions.create({
+            model: modelName,
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userMessage }
+            ],
+            temperature,
+            top_p: 0.7,
+            max_tokens: 65536
+        });
+        return response.choices[0]?.message?.content || '';
+    }
+}
+
 // ─── Main Router ──────────────────────────────────────────────
 export class AIService {
     async generate(
@@ -602,6 +660,8 @@ export class AIService {
                 return generateWithAnthropic(apiKey, model, systemPrompt, fullPrompt, onChunk, generationTemperature);
             case 'ollama':
                 return generateWithOllama(model || DEFAULT_MODELS.ollama, systemPrompt, fullPrompt, onChunk, generationTemperature);
+            case 'nvidia':
+                return generateWithNvidia(apiKey, model || DEFAULT_MODELS.nvidia, systemPrompt, fullPrompt, onChunk, generationTemperature);
             default:
                 throw new Error(`Unsupported AI provider: ${provider}`);
         }
@@ -654,6 +714,8 @@ export class AIService {
                 return this.callAnthropicNonStreaming(resolvedKey, resolvedModel, params.prompt, params.maxTokens, params.temperature);
             case 'ollama':
                 return this.callOllamaNonStreaming(params.prompt, resolvedModel, params.maxTokens, params.temperature);
+            case 'nvidia':
+                return this.callNvidiaNonStreaming(resolvedKey, resolvedModel, params.prompt, params.maxTokens, params.temperature);
             default:
                 throw new Error(`Unknown provider: ${params.provider}`);
         }
@@ -679,12 +741,13 @@ export class AIService {
                 apiKey: params.apiKey,
                 model: params.model,
                 prompt,
-                maxTokens: 600,
+                maxTokens: 1200,
                 temperature: 0.3
             });
         } catch (err) {
             if (isQuotaOrRateLimitError(err)) {
                 console.warn('[requirements] AI question generation failed due to provider quota/rate limit.');
+                track('requirements.question_gen.quota_exceeded', { provider: params.provider });
                 throw new Error('AI question generation is temporarily unavailable due to provider limits. Please retry or use your own API key.');
             }
             throw err;
@@ -694,6 +757,7 @@ export class AIService {
         try {
             parsed = normalizeQuestionsResponse(parseJsonLenient<QuestionsResponse>(rawResponse));
         } catch {
+            track('requirements.question_gen.parse_failed', { provider: params.provider });
             try {
                 const repairPrompt = buildJsonRepairPrompt(
                     rawResponse,
@@ -710,9 +774,45 @@ export class AIService {
                 });
 
                 parsed = normalizeQuestionsResponse(parseJsonLenient<QuestionsResponse>(repaired));
+                track('requirements.question_gen.repaired', { provider: params.provider });
             } catch {
-                console.warn('[requirements] AI question generation failed after JSON parse and repair attempts.');
-                throw new Error('AI returned malformed requirements questions. Please retry with a clearer prompt or a different model.');
+                console.warn('[requirements] AI question generation failed after JSON parse and repair attempts. Falling back to deterministic questions.');
+                const slugBase = params.userIdea
+                    .toLowerCase()
+                    .replace(/[^a-z0-9\s-]/g, ' ')
+                    .trim()
+                    .replace(/\s+/g, '-')
+                    .replace(/-+/g, '-')
+                    .slice(0, 30)
+                    .replace(/^-|-$/g, '') || 'my-app';
+
+                parsed = {
+                    appType: 'other',
+                    projectName: slugBase,
+                    questions: [
+                        {
+                            id: 'qf1',
+                            question: 'What visual style fits your brand - minimal and clean, bold and vibrant, or professional and enterprise?',
+                            hint: 'e.g. minimal and clean, light theme',
+                            category: 'design',
+                            required: true
+                        },
+                        {
+                            id: 'qf2',
+                            question: 'Is this a personal project or a real business launch?',
+                            hint: 'e.g. real business, planning to launch publicly',
+                            category: 'scope',
+                            required: true
+                        },
+                        {
+                            id: 'qf3',
+                            question: 'Are there any specific technologies you want to use?',
+                            hint: 'e.g. Stripe for payments, PostgreSQL for database',
+                            category: 'technical',
+                            required: true
+                        }
+                    ]
+                };
             }
         }
 
@@ -720,6 +820,44 @@ export class AIService {
         if (!Array.isArray(parsed.questions) || parsed.questions.length === 0) {
             throw new Error('AI returned no questions. Please try again.');
         }
+
+        if (parsed.questions.length < 3) {
+            const fallbacks = [
+                {
+                    id: 'qf1',
+                    question: 'What visual style fits your brand - minimal and clean, bold and vibrant, or professional and enterprise?',
+                    hint: 'e.g. minimal and clean, light theme',
+                    category: 'design' as const,
+                    required: false
+                },
+                {
+                    id: 'qf2',
+                    question: 'Is this a personal project or a real business launch?',
+                    hint: 'e.g. real business, planning to launch publicly',
+                    category: 'scope' as const,
+                    required: false
+                },
+                {
+                    id: 'qf3',
+                    question: 'Are there any specific technologies you want to use?',
+                    hint: 'e.g. Stripe for payments, PostgreSQL for database',
+                    category: 'technical' as const,
+                    required: false
+                }
+            ];
+
+            while (parsed.questions.length < 3) {
+                const fallbackIndex = parsed.questions.length;
+                const fb = fallbacks[fallbackIndex];
+                if (!fb) break;
+                parsed.questions.push(fb);
+            }
+        }
+
+        track('requirements.question_gen.success', {
+            provider: params.provider,
+            ideaLength: params.userIdea.length
+        });
 
         return parsed;
     }
@@ -731,6 +869,7 @@ export class AIService {
         selectedModules: string[];
         provider: string;
         apiKey?: string;
+        model?: string;
     }): Promise<RequirementsDocument> {
 
         const prompt = buildRequirementsCompilePrompt(
@@ -748,10 +887,12 @@ export class AIService {
         });
 
         let rawResponse = '';
+        let source: 'ai' | 'fallback' = 'ai';
         try {
             rawResponse = await this.generateNonStreaming({
                 provider: params.provider,
                 apiKey: params.apiKey,
+                model: params.model,
                 prompt,
                 maxTokens: 800,
                 temperature: 0.3
@@ -760,7 +901,17 @@ export class AIService {
             // Free-tier quota/rate limits should not break the UX flow.
             // Return deterministic requirements document instead of bubbling a 500.
             if (isQuotaOrRateLimitError(err)) {
-                return fallbackRequirements;
+                source = 'fallback';
+                track('requirements.compile.success', { provider: params.provider, source });
+                return {
+                    ...fallbackRequirements,
+                    _meta: {
+                        source,
+                        provider: params.provider || 'gemini',
+                        model: params.model || 'default',
+                        timestamp: new Date().toISOString()
+                    }
+                };
             }
             throw err;
         }
@@ -769,6 +920,7 @@ export class AIService {
         try {
             parsed = normalizeRequirementsDocument(parseJsonLenient<RequirementsDocument>(rawResponse));
         } catch {
+            track('requirements.compile.parse_failed', { provider: params.provider });
             try {
                 const repairPrompt = buildJsonRepairPrompt(
                     rawResponse,
@@ -778,15 +930,17 @@ export class AIService {
                 const repaired = await this.generateNonStreaming({
                     provider: params.provider,
                     apiKey: params.apiKey,
-                    model: undefined,
+                    model: params.model,
                     prompt: repairPrompt,
                     maxTokens: 950,
                     temperature: 0
                 });
 
                 parsed = normalizeRequirementsDocument(parseJsonLenient<RequirementsDocument>(repaired));
+                track('requirements.compile.repaired', { provider: params.provider });
             } catch {
                 parsed = fallbackRequirements;
+                source = 'fallback';
             }
         }
 
@@ -801,7 +955,16 @@ export class AIService {
         // Model output may omit or rewrite answers during JSON repair.
         parsed.answers = params.answers;
 
-        return parsed;
+        track('requirements.compile.success', { provider: params.provider, source });
+        return {
+            ...parsed,
+            _meta: {
+                source,
+                provider: params.provider || 'gemini',
+                model: params.model || 'default',
+                timestamp: new Date().toISOString()
+            }
+        };
     }
 
     private async callGeminiNonStreaming(
@@ -877,6 +1040,24 @@ export class AIService {
         return data.response;
     }
 
+    private async callNvidiaNonStreaming(
+        apiKey: string,
+        model: string,
+        prompt: string,
+        maxTokens: number,
+        temperature: number
+    ): Promise<string> {
+        const client = new OpenAI({ apiKey, baseURL: NVIDIA_BASE_URL });
+        const response = await client.chat.completions.create({
+            model,
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: maxTokens,
+            temperature,
+            top_p: 0.7
+        });
+        return response.choices[0]?.message?.content || '';
+    }
+
     async designToCode(
         req: DesignToCodeRequest,
         onChunk?: (chunk: string) => void
@@ -899,6 +1080,8 @@ export class AIService {
                 return generateWithAnthropic(apiKey, model || DEFAULT_MODELS.anthropic, systemPrompt, prompt, onChunk);
             case 'ollama':
                 return generateWithOllama(model || DEFAULT_MODELS.ollama, systemPrompt, prompt, onChunk);
+            case 'nvidia':
+                return generateWithNvidia(apiKey, model || DEFAULT_MODELS.nvidia, systemPrompt, prompt, onChunk);
             default:
                 throw new Error(`Unsupported AI provider: ${provider}`);
         }
@@ -926,6 +1109,8 @@ export class AIService {
                 return generateWithAnthropic(apiKey, model || DEFAULT_MODELS.anthropic, systemPrompt, prompt, onChunk);
             case 'ollama':
                 return generateWithOllama(model || DEFAULT_MODELS.ollama, systemPrompt, prompt, onChunk);
+            case 'nvidia':
+                return generateWithNvidia(apiKey, model || DEFAULT_MODELS.nvidia, systemPrompt, prompt, onChunk);
             default:
                 throw new Error(`Unsupported AI provider: ${provider}`);
         }

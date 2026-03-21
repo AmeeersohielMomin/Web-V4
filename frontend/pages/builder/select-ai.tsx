@@ -15,14 +15,16 @@ const PROVIDER_MODELS: Record<string, string[]> = {
   gemini: ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro'],
   openai: ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4o'],
   anthropic: ['claude-sonnet-4-20250514', 'claude-3-7-sonnet-20250219', 'claude-3-5-haiku-20241022'],
-  ollama: ['llama3.3', 'qwen2.5-coder', 'deepseek-r1']
+  ollama: ['qwen2.5-coder:14b', 'qwen2.5-coder', 'llama3.3', 'deepseek-r1'],
+  nvidia: ['nvidia/nemotron-3-super-120b-a12b', 'meta/llama-3.1-405b-instruct', 'meta/llama-3.3-70b-instruct', 'meta/llama-3.1-70b-instruct']
 };
 
 const PROVIDER_LABELS: Record<string, string> = {
   gemini: 'Google Gemini',
   openai: 'OpenAI GPT',
   anthropic: 'Anthropic Claude',
-  ollama: 'Ollama (Local)'
+  ollama: 'Ollama (Local)',
+  nvidia: 'NVIDIA NIM'
 };
 
 const ADDITIONAL_STEPS = [
@@ -111,6 +113,8 @@ export default function SelectAiPage() {
   const [model, setModel] = useState('gemini-2.5-flash');
   const [apiKey, setApiKey] = useState('');
   const [selectedModules, setSelectedModules] = useState<string[]>(['auth']);
+  const [showProviderFallback, setShowProviderFallback] = useState(false);
+  const [providerFallbackMsg, setProviderFallbackMsg] = useState('');
 
   useEffect(() => {
     try {
@@ -137,6 +141,28 @@ export default function SelectAiPage() {
   }, [provider, model]);
 
   const flow = useRequirementsFlow({ selectedModules, provider, apiKey, model });
+
+  useEffect(() => {
+    if (flow.errorStatus === 429) {
+      const waitMsg = flow.retryAfter
+        ? ` Wait ${flow.retryAfter} seconds or`
+        : ' Please';
+      setProviderFallbackMsg(
+        `The ${provider} provider is currently rate-limited.${waitMsg} switch to a different provider.`
+      );
+      setShowProviderFallback(true);
+      return;
+    }
+
+    if (flow.errorStatus !== 429) {
+      setShowProviderFallback(false);
+      setProviderFallbackMsg('');
+    }
+  }, [flow.errorStatus, flow.retryAfter, provider]);
+
+  const handleAskQuestions = async () => {
+    await flow.askQuestions();
+  };
 
   const appendAdditionalStep = (step: string) => {
     const idea = flow.userIdea.trim();
@@ -299,6 +325,78 @@ export default function SelectAiPage() {
             <p className="text-rose-600 text-sm mt-2">{flow.error}</p>
           )}
 
+          {flow.error && !showProviderFallback && (
+            <button
+              onClick={() => { void handleAskQuestions(); }}
+              disabled={flow.loading}
+              className="mt-2 text-sm text-indigo-600 hover:underline disabled:opacity-50"
+            >
+              ↺ Try again
+            </button>
+          )}
+
+          {showProviderFallback && (
+            <div className="mt-3 p-4 bg-amber-50 border border-amber-200 rounded-xl">
+              <p className="text-sm font-semibold text-amber-800 mb-1">
+                Provider limit reached
+              </p>
+              <p className="text-sm text-amber-700 mb-3">{providerFallbackMsg}</p>
+
+              <p className="text-xs font-semibold text-amber-800 mb-2 uppercase tracking-wide">
+                Switch provider:
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {(['gemini', 'openai', 'anthropic', 'ollama', 'nvidia'] as const).map((p) => (
+                  <button
+                    key={p}
+                    onClick={() => {
+                      setProvider(p);
+                      setShowProviderFallback(false);
+                      setProviderFallbackMsg('');
+                      flow.clearError();
+                    }}
+                    className={`px-3 py-1.5 text-sm rounded-lg border transition-colors ${
+                      provider === p
+                        ? 'bg-indigo-600 text-white border-indigo-600'
+                        : 'bg-white text-gray-700 border-gray-300 hover:border-indigo-400'
+                    }`}
+                  >
+                    {p.charAt(0).toUpperCase() + p.slice(1)}
+                    {p === 'gemini' && ' (free)'}
+                  </button>
+                ))}
+              </div>
+
+              {(provider === 'openai' || provider === 'anthropic' || provider === 'nvidia') && (
+                <div className="mt-3">
+                  <p className="text-xs text-amber-700 mb-1">
+                    {provider === 'openai' ? 'OpenAI' : 'Anthropic'} requires your API key:
+                  </p>
+                  <input
+                    type="password"
+                    value={apiKey}
+                    onChange={(e) => setApiKey(e.target.value)}
+                    placeholder={`Paste your ${provider === 'openai' ? 'OpenAI' : 'Anthropic'} API key`}
+                    className="w-full h-10 px-3 text-sm border border-amber-300 rounded-lg focus:outline-none focus:border-indigo-500 bg-white"
+                  />
+                </div>
+              )}
+
+              <button
+                onClick={() => {
+                  setShowProviderFallback(false);
+                  setProviderFallbackMsg('');
+                  flow.clearError();
+                  void handleAskQuestions();
+                }}
+                disabled={flow.loading}
+                className="mt-3 px-4 py-2 bg-indigo-600 text-white text-sm font-semibold rounded-lg hover:bg-indigo-700 disabled:opacity-50 transition-colors"
+              >
+                {flow.loading ? 'Trying...' : `Retry with ${provider}`}
+              </button>
+            </div>
+          )}
+
           <div className="flex items-center justify-between mt-4">
             <button
               onClick={flow.skipToConfirm}
@@ -309,7 +407,7 @@ export default function SelectAiPage() {
             </button>
 
             <button
-              onClick={flow.askQuestions}
+              onClick={() => { void handleAskQuestions(); }}
               disabled={flow.userIdea.trim().length < 10}
               className="px-6 py-3 bg-slate-900 text-white font-semibold rounded-xl hover:bg-slate-800 active:scale-95 transition-all disabled:opacity-40"
             >
@@ -430,6 +528,12 @@ export default function SelectAiPage() {
             <span className="text-xs bg-slate-100 text-slate-700 px-3 py-1 rounded-full border border-slate-200">
               Scale: {req.scale}
             </span>
+            {req._meta && (
+              <span className="text-xs bg-gray-50 text-gray-500 px-3 py-1 rounded-full border border-gray-200">
+                Generated by {req._meta.provider}
+                {req._meta.model !== 'default' ? ` · ${req._meta.model}` : ''}
+              </span>
+            )}
           </div>
 
           <div className="flex items-center justify-between">

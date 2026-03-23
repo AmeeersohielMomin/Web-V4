@@ -18,7 +18,8 @@ export class PlatformAuthController {
       const result = await platformAuthService.register(
         input.email,
         input.password,
-        input.name
+        input.name,
+        input.inviteToken
       );
       res.status(201).json({ success: true, data: result, error: null });
     } catch (err: any) {

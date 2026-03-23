@@ -7,6 +7,7 @@ import api from '@/lib/api';
 
 const PROVIDERS = [
   { id: 'openai', label: 'OpenAI', placeholder: 'sk-...' },
+  { id: 'github', label: 'GitHub Models', placeholder: 'github_pat_... (models:read)' },
   { id: 'gemini', label: 'Google Gemini', placeholder: 'AIza...' },
   { id: 'anthropic', label: 'Anthropic', placeholder: 'sk-ant-...' },
   { id: 'ollama', label: 'Ollama (Local)', placeholder: 'http://localhost:11434' },

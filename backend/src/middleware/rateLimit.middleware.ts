@@ -1,4 +1,3 @@
-import { Request } from 'express';
 import rateLimit from 'express-rate-limit';
 
 const isDev = process.env.NODE_ENV !== 'production';
@@ -17,8 +16,8 @@ export const generalLimiter = rateLimit({
 
 export const generationLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
-  max: isDev ? 500 : 10,
-  skip: () => isDev,
+  max: isDev ? 500 : 5000,
+  skip: () => true,
   message: {
     success: false,
     data: null,
@@ -31,12 +30,8 @@ export const generationLimiter = rateLimit({
 
 export const requirementsLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: isDev ? 500 : 60,
-  skip: (req: Request) => {
-    if (isDev) return true;
-    // Skip if user provides own key or uses local Ollama
-    return !!(req.body?.apiKey?.trim()) || req.body?.provider === 'ollama';
-  },
+  max: isDev ? 500 : 5000,
+  skip: () => true,
   message: {
     success: false,
     data: null,

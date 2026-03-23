@@ -3,7 +3,8 @@ import { z } from 'zod';
 export const registerSchema = z.object({
   email: z.string().email('Please enter a valid email'),
   password: z.string().min(8, 'Password must be at least 8 characters'),
-  name: z.string().min(1).optional()
+  name: z.string().min(1).optional(),
+  inviteToken: z.string().min(1).optional()
 });
 
 export const loginSchema = z.object({
@@ -31,6 +32,6 @@ export const resetPasswordSchema = z.object({
 });
 
 export const saveApiKeySchema = z.object({
-  provider: z.enum(['openai', 'gemini', 'anthropic', 'ollama']),
+  provider: z.enum(['openai', 'github', 'gemini', 'anthropic', 'ollama']),
   key: z.string().min(1, 'API key is required')
 });

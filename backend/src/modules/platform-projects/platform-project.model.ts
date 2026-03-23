@@ -48,6 +48,12 @@ const platformProjectSchema = new mongoose.Schema(
       required: true,
       index: true
     },
+    teamId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Team',
+      default: null,
+      index: true
+    },
     name: { type: String, required: true },
     description: { type: String },
     modules: [String],

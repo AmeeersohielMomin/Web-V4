@@ -50,4 +50,5 @@ export interface NonStreamingParams {
   prompt: string;
   maxTokens: number;
   temperature: number;
+  forceJson?: boolean;
 }

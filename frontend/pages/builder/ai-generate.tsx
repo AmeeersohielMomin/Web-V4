@@ -114,6 +114,97 @@ function buildFileTree(files: GeneratedFile[]): TreeNode[] {
     return root;
 }
 
+function buildRefineContextFiles(files: GeneratedFile[], prompt: string): Array<{ path: string; content: string }> {
+    const normalizedPrompt = String(prompt || '').toLowerCase();
+    const terms = normalizedPrompt.split(/[^a-z0-9]+/i).filter((t) => t.length > 2);
+
+    const scoreFile = (file: GeneratedFile): number => {
+        const path = String(file.path || '').toLowerCase();
+        let score = 0;
+        if (/frontend\//.test(path)) score += 3;
+        if (/backend\//.test(path)) score += 2;
+        if (/pages\//.test(path)) score += 3;
+        if (/service/.test(path)) score += 2;
+        if (/controller|routes|schema|model/.test(path)) score += 1;
+        if (/index\.|dashboard\.|server\./.test(path)) score += 2;
+        for (const term of terms) {
+            if (path.includes(term)) score += 4;
+        }
+        return score;
+    };
+
+    const sorted = [...(files || [])].sort((a, b) => scoreFile(b) - scoreFile(a));
+    const selected = sorted.slice(0, 18);
+
+    const maxCharsPerFile = 1400;
+    const maxTotalChars = 22000;
+    let totalChars = 0;
+
+    const result: Array<{ path: string; content: string }> = [];
+    for (const file of selected) {
+        if (totalChars >= maxTotalChars) break;
+        const raw = String(file.content || '');
+        const remaining = Math.max(0, maxTotalChars - totalChars);
+        const limit = Math.min(maxCharsPerFile, remaining);
+        const content = raw.length > limit ? `${raw.slice(0, limit)}\n// ...truncated for refine context` : raw;
+        totalChars += content.length;
+        result.push({ path: file.path, content });
+    }
+
+    return result;
+}
+
+function buildChatProjectContext(files: GeneratedFile[]): { fileCount: number; keyFiles: string[]; modules: string[] } {
+    const paths = (files || []).map((f) => String(f.path || ''));
+    const moduleSet = new Set<string>();
+    for (const path of paths) {
+        const normalized = path.replace(/\\/g, '/').toLowerCase();
+        const match = normalized.match(/^backend\/src\/modules\/([^/]+)\//);
+        if (match?.[1]) moduleSet.add(match[1]);
+    }
+
+    const keyFiles = paths.slice(0, 40);
+    return {
+        fileCount: paths.length,
+        keyFiles,
+        modules: Array.from(moduleSet).slice(0, 20)
+    };
+}
+
+function isRefinementIntent(message: string): boolean {
+    const text = String(message || '').toLowerCase();
+    return /(add|update|change|modify|fix|refactor|implement|create|remove|rename|improve|integrate|build|make|generate|code|api|page|component|route|schema|model)/.test(text);
+}
+
+function resolveModelForProvider(providerRaw: string, modelRaw?: string): string {
+    const provider = String(providerRaw || 'gemini').trim().toLowerCase();
+    const model = String(modelRaw || '').trim().replace(/^\/+/, '');
+
+    if (provider === 'github') {
+        if (/^[a-z0-9-]+\/[a-z0-9-._]+$/i.test(model)) return model;
+        if (/^gpt-/i.test(model)) return `openai/${model}`;
+        if (/^llama-4-maverick$/i.test(model)) return 'meta/llama-4-maverick';
+        return 'openai/gpt-4.1';
+    }
+
+    if (provider === 'openai') {
+        const normalized = model.replace(/^openai\//i, '');
+        if (!normalized || /^(gemini|claude|meta\/|nvidia\/|qwen|llama)/i.test(normalized)) {
+            return 'gpt-4.1';
+        }
+        return normalized;
+    }
+
+    if (provider === 'gemini') {
+        if (!model || /^(openai\/|meta\/|nvidia\/|claude|gpt-|qwen|llama)/i.test(model)) {
+            return 'gemini-2.5-flash';
+        }
+        return model;
+    }
+
+    return model || 'gemini-2.5-flash';
+}
+
 export default function AIGenerate() {
     const router = useRouter();
     const { user, logout } = useAuth();
@@ -142,6 +233,7 @@ export default function AIGenerate() {
     const [chatMessages, setChatMessages] = useState<Array<{ role: 'user' | 'assistant'; content: string; timestamp: Date }>>([]); 
     const [chatInput, setChatInput] = useState('');
     const [chatLoading, setChatLoading] = useState(false);
+    const [chatBackendOfflineUntil, setChatBackendOfflineUntil] = useState<number>(0);
     const chatEndRef = useRef<HTMLDivElement>(null);
     const [showExportMenu, setShowExportMenu] = useState(false);
     const [isPublished, setIsPublished] = useState(false);
@@ -214,6 +306,14 @@ export default function AIGenerate() {
             const data = JSON.parse(saved);
             const storedRequirements = data?.requirements || null;
             setProjectRequirements(storedRequirements);
+
+            const normalizedProvider = String(data.aiProvider || data.provider || 'gemini').toLowerCase();
+            const normalizedModel = resolveModelForProvider(normalizedProvider, data.aiModel || data.model);
+            data.aiProvider = normalizedProvider;
+            data.provider = normalizedProvider;
+            data.aiModel = normalizedModel;
+            data.model = normalizedModel;
+
             setProjectData(data);
             if (Array.isArray(data.chatHistory)) {
                 setChatHistory(data.chatHistory);
@@ -232,7 +332,7 @@ export default function AIGenerate() {
 
             setUserPrompt(
                 data.userPrompt || requirementsPrompt ||
-                `Build a ${data.projectName || 'web app'} with ${(data.modules || ['auth']).join(', ')} functionality`
+                `Build a complete full-stack ${data.projectName || 'web app'} based on the provided idea`
             );
         };
 
@@ -273,17 +373,17 @@ export default function AIGenerate() {
             ? {
                 provider: projectData.aiProvider || 'gemini',
                 apiKey: projectData.aiApiKey || undefined,
-                model: projectData.aiModel || 'gemini-2.5-flash',
-                previousCode: generatedProject?.files?.map(f => ({ path: f.path, content: f.content })) || [],
+                model: resolveModelForProvider(projectData.aiProvider || 'gemini', projectData.aiModel),
+                previousCode: buildRefineContextFiles(generatedProject?.files || [], prompt),
                 refinementRequest: prompt,
                 projectId: generatedProject?.projectId || null
             }
             : {
                 provider: projectData.aiProvider || 'gemini',
                 apiKey: projectData.aiApiKey || undefined,
-                model: projectData.aiModel || 'gemini-2.5-flash',
+                model: resolveModelForProvider(projectData.aiProvider || 'gemini', projectData.aiModel),
                 userPrompt: prompt,
-                selectedModules: projectData.modules || ['auth'],
+                selectedModules: Array.isArray(projectData.modules) ? projectData.modules : [],
                 projectName: projectData.projectName,
                 requirements: projectRequirements ?? undefined
             };
@@ -573,12 +673,78 @@ export default function AIGenerate() {
         setChatMessages(prev => [...prev, { role: 'user', content: msg, timestamp: new Date() }]);
         setChatLoading(true);
 
-        // Use the existing refine flow
-        setChatHistory(current => [...current, { type: 'refine', prompt: msg, createdAt: new Date().toISOString() }]);
-        await generate(msg, true);
+        try {
+            if (isRefinementIntent(msg)) {
+                setChatHistory(current => [...current, { type: 'refine', prompt: msg, createdAt: new Date().toISOString() }]);
+                await generate(msg, true);
+                setChatMessages(prev => [...prev, { role: 'assistant', content: 'Code updated based on your request.', timestamp: new Date() }]);
+            } else {
+                if (Date.now() < chatBackendOfflineUntil) {
+                    setChatMessages(prev => [
+                        ...prev,
+                        {
+                            role: 'assistant',
+                            content: 'AI chat is temporarily unavailable because backend API is offline. Start backend on http://localhost:5000 and retry in a few seconds.',
+                            timestamp: new Date()
+                        }
+                    ]);
+                    return;
+                }
 
-        setChatMessages(prev => [...prev, { role: 'assistant', content: '✅ Code updated based on your request.', timestamp: new Date() }]);
-        setChatLoading(false);
+                const token = getToken();
+                const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+                if (token) headers.Authorization = `Bearer ${token}`;
+
+                const response = await fetch(`${API_BASE_URL}/api/ai/chat`, {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify({
+                        provider: projectData.aiProvider || 'gemini',
+                        apiKey: projectData.aiApiKey || undefined,
+                        model: resolveModelForProvider(projectData.aiProvider || 'gemini', projectData.aiModel),
+                        message: msg,
+                        projectContext: {
+                            projectName: generatedProject.projectName,
+                            description: generatedProject.description,
+                            ...buildChatProjectContext(generatedProject.files || [])
+                        }
+                    })
+                });
+
+                if (!response.ok) {
+                    let errorMessage = `Chat request failed (${response.status})`;
+                    try {
+                        const errData = await response.json();
+                        if (errData?.error) errorMessage = String(errData.error);
+                    } catch {
+                        // Keep default error message.
+                    }
+                    throw new Error(errorMessage);
+                }
+
+                const data = await response.json();
+                const reply = data?.data?.reply || 'I could not generate a response right now.';
+                setChatMessages(prev => [...prev, { role: 'assistant', content: String(reply), timestamp: new Date() }]);
+            }
+        } catch (err: any) {
+            const message = err?.message || 'Something went wrong while processing your request.';
+
+            const lowered = String(message).toLowerCase();
+            const isConnectivityError =
+                lowered.includes('failed to fetch') ||
+                lowered.includes('networkerror') ||
+                lowered.includes('err_connection_refused') ||
+                lowered.includes('connection refused');
+
+            if (isConnectivityError) {
+                // Pause chat network requests for a short window to avoid repeated console/network spam.
+                setChatBackendOfflineUntil(Date.now() + 30_000);
+            }
+
+            setChatMessages(prev => [...prev, { role: 'assistant', content: `Error: ${message}`, timestamp: new Date() }]);
+        } finally {
+            setChatLoading(false);
+        }
     };
 
     // ─── Export handlers ───
@@ -661,7 +827,17 @@ export default function AIGenerate() {
         }
     }, [projectData, projectRequirements, generatedProject, chatHistory]);
 
-    const providerLabel = projectData?.aiProvider === 'openai' ? 'OpenAI' : projectData?.aiProvider === 'anthropic' ? 'Claude' : 'Gemini';
+    const providerLabel = projectData?.aiProvider === 'openai'
+        ? 'OpenAI'
+        : projectData?.aiProvider === 'anthropic'
+            ? 'Claude'
+            : projectData?.aiProvider === 'github'
+                ? 'GitHub Models'
+                : projectData?.aiProvider === 'nvidia'
+                    ? 'NVIDIA NIM'
+                    : projectData?.aiProvider === 'ollama'
+                        ? 'Ollama'
+                        : 'Gemini';
 
     const activeFileContent = generatedProject?.files.find(f => f.path === activeFile)?.content || '';
     const fileTree = generatedProject ? buildFileTree(generatedProject.files) : [];

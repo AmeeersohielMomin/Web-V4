@@ -22,7 +22,14 @@ function mapProject(raw: any): DashboardProject {
     tags: Array.isArray(raw.tags) ? raw.tags : [],
     vercelDeployUrl: raw.vercelDeployUrl ? String(raw.vercelDeployUrl) : undefined,
     githubRepoUrl: raw.githubRepoUrl ? String(raw.githubRepoUrl) : undefined,
-    railwayServiceUrl: raw.railwayServiceUrl ? String(raw.railwayServiceUrl) : undefined
+    railwayServiceUrl: raw.railwayServiceUrl ? String(raw.railwayServiceUrl) : undefined,
+    accessRole: raw.accessRole,
+    isOwner: !!raw.isOwner,
+    canWrite: typeof raw.canWrite === 'boolean' ? raw.canWrite : true,
+    canDelete: typeof raw.canDelete === 'boolean' ? raw.canDelete : true,
+    canPublish: typeof raw.canPublish === 'boolean' ? raw.canPublish : true,
+    canDeploy: typeof raw.canDeploy === 'boolean' ? raw.canDeploy : true,
+    isTeamProject: !!raw.isTeamProject
   };
 }
 
@@ -32,7 +39,6 @@ export default function DashboardPage() {
   const [projects, setProjects] = useState<DashboardProject[]>([]);
   const [loadingProjects, setLoadingProjects] = useState(true);
   const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
-  const [billingLoading, setBillingLoading] = useState(false);
   const [error, setError] = useState('');
 
   const fetchProjects = useCallback(async () => {
@@ -89,6 +95,11 @@ export default function DashboardPage() {
   };
 
   const handleDelete = async (project: DashboardProject) => {
+    if (project.canDelete === false) {
+      setError('You do not have permission to delete this project.');
+      return;
+    }
+
     const confirmed = window.confirm(`Delete ${project.name}? This cannot be undone.`);
     if (!confirmed) {
       return;
@@ -106,6 +117,11 @@ export default function DashboardPage() {
   };
 
   const handlePublish = async (project: DashboardProject) => {
+    if (project.canPublish === false) {
+      setError('Only the project owner can change publish settings.');
+      return;
+    }
+
     setActionLoadingId(project.id);
     try {
       await api.patch(`/api/platform/projects/${project.id}/public`, { isPublic: !project.isPublic });
@@ -118,42 +134,6 @@ export default function DashboardPage() {
       setActionLoadingId(null);
     }
   };
-
-  const handleUpgrade = async (planId: 'starter' | 'pro') => {
-    setBillingLoading(true);
-    setError('');
-    try {
-      const response = await api.post('/api/platform/billing/checkout', { planId });
-      const checkoutUrl = response.data?.data?.url;
-      if (!checkoutUrl) {
-        throw new Error('Missing checkout URL');
-      }
-      window.location.href = checkoutUrl;
-    } catch (err: any) {
-      setError(err?.response?.data?.error || 'Unable to start checkout');
-      setBillingLoading(false);
-    }
-  };
-
-  const handleManageBilling = async () => {
-    setBillingLoading(true);
-    setError('');
-    try {
-      const response = await api.post('/api/platform/billing/portal');
-      const portalUrl = response.data?.data?.url;
-      if (!portalUrl) {
-        throw new Error('Missing portal URL');
-      }
-      window.location.href = portalUrl;
-    } catch (err: any) {
-      setError(err?.response?.data?.error || 'Unable to open billing portal');
-      setBillingLoading(false);
-    }
-  };
-
-  const hasReachedLimit =
-    (user?.generationsLimit || 0) !== -1 &&
-    (user?.generationsUsed || 0) >= (user?.generationsLimit || 0);
 
   return (
     <ProtectedRoute>
@@ -186,9 +166,7 @@ export default function DashboardPage() {
             <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
               <p className="text-xs uppercase tracking-wide text-slate-500">Total Projects</p>
               <p className="mt-2 text-3xl font-bold text-slate-900">{projects.length}</p>
-              <p className="mt-2 text-sm text-slate-600 capitalize">
-                Plan: {user?.plan || 'free'}
-              </p>
+              <p className="mt-2 text-sm text-slate-600">Access: Unlimited</p>
             </div>
             {user?.teamId && (
               <div className="rounded-2xl border border-violet-200 bg-violet-50 p-5 shadow-sm">
@@ -202,49 +180,10 @@ export default function DashboardPage() {
             <div className={user?.teamId ? '' : 'md:col-span-2'}>
               <UsageMeter
                 used={user?.generationsUsed}
-                limit={user?.generationsLimit}
+                limit={-1}
               />
             </div>
           </div>
-
-          {hasReachedLimit && (
-            <div className="mb-6 rounded-2xl border border-amber-200 bg-amber-50 p-4">
-              <h2 className="text-lg font-semibold text-amber-900">
-                You have reached your free generation limit
-              </h2>
-              <p className="mt-1 text-sm text-amber-800">
-                Upgrade to continue building more apps this month.
-              </p>
-              <div className="mt-3 flex flex-wrap gap-2">
-                <button
-                  onClick={() => void handleUpgrade('starter')}
-                  disabled={billingLoading}
-                  className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-60"
-                >
-                  Upgrade to Starter ($19/mo)
-                </button>
-                <button
-                  onClick={() => void handleUpgrade('pro')}
-                  disabled={billingLoading}
-                  className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-100 disabled:opacity-60"
-                >
-                  Upgrade to Pro ($49/mo)
-                </button>
-              </div>
-            </div>
-          )}
-
-          {user?.plan && user.plan !== 'free' && (
-            <div className="mb-6">
-              <button
-                onClick={() => void handleManageBilling()}
-                disabled={billingLoading}
-                className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-60"
-              >
-                Manage Billing
-              </button>
-            </div>
-          )}
 
           {error && (
             <p className="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">

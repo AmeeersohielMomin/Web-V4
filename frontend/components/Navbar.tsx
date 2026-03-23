@@ -41,6 +41,12 @@ export default function Navbar({ user, onLogout }: NavbarProps) {
             <p className="text-xs text-slate-500">{user.email}</p>
           </div>
           <Link
+            href="/team"
+            className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-100 sm:hidden"
+          >
+            Team
+          </Link>
+          <Link
             href="/settings"
             className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-100"
           >

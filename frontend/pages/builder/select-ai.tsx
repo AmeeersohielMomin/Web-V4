@@ -14,6 +14,7 @@ import type { RequirementsDocument } from '../../types/generation';
 const PROVIDER_MODELS: Record<string, string[]> = {
   gemini: ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro'],
   openai: ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4o'],
+  github: ['openai/gpt-4.1', 'meta/llama-4-maverick'],
   anthropic: ['claude-sonnet-4-20250514', 'claude-3-7-sonnet-20250219', 'claude-3-5-haiku-20241022'],
   ollama: ['qwen2.5-coder:14b', 'qwen2.5-coder', 'llama3.3', 'deepseek-r1'],
   nvidia: ['nvidia/nemotron-3-super-120b-a12b', 'meta/llama-3.1-405b-instruct', 'meta/llama-3.3-70b-instruct', 'meta/llama-3.1-70b-instruct']
@@ -22,6 +23,7 @@ const PROVIDER_MODELS: Record<string, string[]> = {
 const PROVIDER_LABELS: Record<string, string> = {
   gemini: 'Google Gemini',
   openai: 'OpenAI GPT',
+  github: 'GitHub Models',
   anthropic: 'Anthropic Claude',
   ollama: 'Ollama (Local)',
   nvidia: 'NVIDIA NIM'
@@ -112,7 +114,7 @@ export default function SelectAiPage() {
   const [provider, setProvider] = useState('gemini');
   const [model, setModel] = useState('gemini-2.5-flash');
   const [apiKey, setApiKey] = useState('');
-  const [selectedModules, setSelectedModules] = useState<string[]>(['auth']);
+  const [selectedModules, setSelectedModules] = useState<string[]>([]);
   const [showProviderFallback, setShowProviderFallback] = useState(false);
   const [providerFallbackMsg, setProviderFallbackMsg] = useState('');
 
@@ -346,7 +348,7 @@ export default function SelectAiPage() {
                 Switch provider:
               </p>
               <div className="flex flex-wrap gap-2">
-                {(['gemini', 'openai', 'anthropic', 'ollama', 'nvidia'] as const).map((p) => (
+                {(['gemini', 'openai', 'github', 'anthropic', 'ollama', 'nvidia'] as const).map((p) => (
                   <button
                     key={p}
                     onClick={() => {
@@ -367,16 +369,27 @@ export default function SelectAiPage() {
                 ))}
               </div>
 
-              {(provider === 'openai' || provider === 'anthropic' || provider === 'nvidia') && (
+              {(provider === 'openai' || provider === 'anthropic' || provider === 'nvidia' || provider === 'github') && (
                 <div className="mt-3">
                   <p className="text-xs text-amber-700 mb-1">
-                    {provider === 'openai' ? 'OpenAI' : 'Anthropic'} requires your API key:
+                    {(provider === 'openai' && 'OpenAI') ||
+                      (provider === 'anthropic' && 'Anthropic') ||
+                      (provider === 'nvidia' && 'NVIDIA') ||
+                      'GitHub Models'} requires your API key:
                   </p>
                   <input
                     type="password"
                     value={apiKey}
                     onChange={(e) => setApiKey(e.target.value)}
-                    placeholder={`Paste your ${provider === 'openai' ? 'OpenAI' : 'Anthropic'} API key`}
+                    placeholder={`Paste your ${
+                      provider === 'openai'
+                        ? 'OpenAI'
+                        : provider === 'anthropic'
+                          ? 'Anthropic'
+                          : provider === 'nvidia'
+                            ? 'NVIDIA'
+                            : 'GitHub Models'
+                    } API key`}
                     className="w-full h-10 px-3 text-sm border border-amber-300 rounded-lg focus:outline-none focus:border-indigo-500 bg-white"
                   />
                 </div>

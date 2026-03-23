@@ -175,14 +175,83 @@ export default function PreviewRunner() {
     };
 
     const createAxiosMockModule = () => {
-      const responseFactory = (data: any = {}) =>
+      const mockAssetRows = [
+        {
+          _id: 'asset-1',
+          name: 'Heritage Villa',
+          assetType: 'real_estate',
+          legalOwner: 'Family Trust',
+          conditionGrade: 'A'
+        },
+        {
+          _id: 'asset-2',
+          name: 'Gold Collection',
+          assetType: 'jewelry',
+          legalOwner: 'Primary Nominee',
+          conditionGrade: 'A'
+        }
+      ];
+
+      const responseFactory = (payload: any = {}) => {
+        const isArrayPayload = Array.isArray(payload);
+        const safeObjectPayload =
+          payload && typeof payload === 'object' && !isArrayPayload ? payload : {};
+
+        const normalizedData = {
+          success: true,
+          data: payload,
+          error: null,
+          ...safeObjectPayload,
+          ...(isArrayPayload
+            ? {
+                items: payload,
+                rows: payload,
+                list: payload,
+                results: payload,
+                total: payload.length
+              }
+            : {})
+        };
+
         Promise.resolve({
-          data,
+          data: normalizedData,
           status: 200,
           statusText: 'OK',
           headers: {},
           config: {}
         });
+      };
+
+      const inferMockData = (urlLike: any, method: string): any => {
+        const url = String(urlLike || '').toLowerCase();
+        const isStats = /\/stats\b/.test(url) || /stats/.test(url);
+        if (isStats) {
+          return {
+            total: 12,
+            pending: 3,
+            completed: 7,
+            recent: 4,
+            active: 9,
+            count: 12
+          };
+        }
+
+        if (method === 'get') {
+          if (/\bassets\b/.test(url)) return mockAssetRows;
+          if (/\b(provenance|transfers|valuations|events|records)\b/.test(url)) {
+            return [
+              { _id: 'row-1', name: 'Sample Record', title: 'Sample Record', status: 'active' }
+            ];
+          }
+          return [];
+        }
+
+        if (method === 'post' || method === 'put' || method === 'patch') {
+          return { success: true };
+        }
+
+        return {};
+      };
 
       const axiosInstance: any = {
         defaults: {},
@@ -190,14 +259,17 @@ export default function PreviewRunner() {
           request: { use: () => 0, eject: () => {} },
           response: { use: () => 0, eject: () => {} }
         },
-        request: () => responseFactory(),
-        get: () => responseFactory(),
-        delete: () => responseFactory(),
+        request: (config: any = {}) => {
+          const method = String(config?.method || 'get').toLowerCase();
+          return responseFactory(inferMockData(config?.url, method));
+        },
+        get: (url?: string) => responseFactory(inferMockData(url, 'get')),
+        delete: (url?: string) => responseFactory(inferMockData(url, 'delete')),
         head: () => responseFactory(),
         options: () => responseFactory(),
-        post: () => responseFactory(),
-        put: () => responseFactory(),
-        patch: () => responseFactory(),
+        post: (url?: string) => responseFactory(inferMockData(url, 'post')),
+        put: (url?: string) => responseFactory(inferMockData(url, 'put')),
+        patch: (url?: string) => responseFactory(inferMockData(url, 'patch')),
         create: () => axiosInstance
       };
 
@@ -681,6 +753,9 @@ export default function PreviewRunner() {
           }
 
           if (id === 'axios') {
+            if (currentStack !== 'vue') {
+              return null;
+            }
             const noop = async () => ({ data: {}, status: 200, statusText: 'OK', headers: {}, config: {} });
             const axiosMock: any = noop;
             axiosMock.get = noop; axiosMock.post = noop; axiosMock.put = noop;
@@ -1114,9 +1189,131 @@ export default function PreviewRunner() {
             }
 
             const RuntimeErrorBoundary = createRuntimeErrorBoundary(React_r);
+            const getFallbackPageComponent = (): any => {
+              const preferredPageNames = ['pages/index', 'pages/dashboard', 'pages/home', 'pages/login'];
+              const renderablePage = allFiles.find((f) => {
+                const normalizedPath = normalizePath(f.path).toLowerCase();
+                if (!/\.(tsx|jsx|ts|js)$/.test(normalizedPath)) return false;
+                if (!normalizedPath.includes('/pages/')) return false;
+                if (normalizedPath.endsWith('/_app.tsx') || normalizedPath.endsWith('/_app.jsx')) return false;
+                if (preferredPageNames.some((name) => normalizedPath.includes(name))) return true;
+                return normalizedPath.endsWith('/index.tsx') || normalizedPath.endsWith('/dashboard.tsx');
+              });
+
+              if (renderablePage) {
+                try {
+                  const pageModule = compileModule(renderablePage.content, renderablePage.path);
+                  const pageComp = pageModule?.default || pageModule?.Page || Object.values(pageModule || {}).find((v: any) => typeof v === 'function');
+                  if (typeof pageComp === 'function') {
+                    return pageComp;
+                  }
+                } catch (err) {
+                  console.warn('[PreviewEngine] Failed to compile fallback page component for Next _app render.', err);
+                }
+              }
+
+              return () =>
+                React_r.createElement(
+                  'div',
+                  { className: 'p-6 text-sm text-zinc-300' },
+                  'Preview page component is unavailable.'
+                );
+            };
+
+            const buildPreviewProps = () => {
+              const componentSource = typeof Component === 'function' ? String(Component) : '';
+              const looksLikeNextApp =
+                /\bMyApp\b/.test(componentSource) ||
+                /\bComponent\b/.test(componentSource) ||
+                entryPath.toLowerCase().endsWith('/_app.tsx') ||
+                entryPath.toLowerCase().endsWith('/_app.jsx');
+
+              if (!looksLikeNextApp) return {};
+
+              return {
+                Component: getFallbackPageComponent(),
+                pageProps: {}
+              };
+            };
+
+            const isAsyncComponent =
+              typeof Component === 'function' &&
+              Component.constructor &&
+              Component.constructor.name === 'AsyncFunction';
+
+            const previewProps = buildPreviewProps();
+
+            const AsyncComponentBridge = ({ Comp }: { Comp: any }) => {
+              const [resolvedNode, setResolvedNode] = React_r.useState(
+                React_r.createElement('div', { className: 'p-4 text-sm text-zinc-300' }, 'Loading async component...')
+              );
+
+              React_r.useEffect(() => {
+                let isMounted = true;
+
+                Promise.resolve()
+                  .then(() => Comp({}))
+                  .then((value: any) => {
+                    if (!isMounted) return;
+
+                    if (React_r.isValidElement(value)) {
+                      setResolvedNode(value);
+                      return;
+                    }
+
+                    if (typeof value === 'function') {
+                      setResolvedNode(React_r.createElement(value));
+                      return;
+                    }
+
+                    if (value === null || value === undefined || value === false) {
+                      setResolvedNode(null);
+                      return;
+                    }
+
+                    if (typeof value === 'string' || typeof value === 'number') {
+                      setResolvedNode(React_r.createElement('div', null, value));
+                      return;
+                    }
+
+                    setResolvedNode(
+                      React_r.createElement(
+                        'pre',
+                        {
+                          className: 'm-4 rounded border border-amber-500/30 bg-amber-950/20 p-3 text-xs text-amber-200 whitespace-pre-wrap'
+                        },
+                        `Async component returned unsupported value:\n${String(value)}`
+                      )
+                    );
+                  })
+                  .catch((err: any) => {
+                    if (!isMounted) return;
+                    setResolvedNode(
+                      React_r.createElement(
+                        'div',
+                        {
+                          className: 'm-4 rounded border border-rose-500/40 bg-rose-950/30 p-4 text-sm text-rose-300'
+                        },
+                        `Async component error: ${err?.message || String(err)}`
+                      )
+                    );
+                  });
+
+                return () => {
+                  isMounted = false;
+                };
+              }, [Comp]);
+
+              return resolvedNode;
+            };
+
             const element = React_r.isValidElement(Component)
               ? React_r.createElement(RuntimeErrorBoundary, null, Component)
-              : React_r.createElement(RuntimeErrorBoundary, null, React_r.createElement(Component));
+              : isAsyncComponent
+                ? React_r.createElement(RuntimeErrorBoundary, null, React_r.createElement(AsyncComponentBridge, {
+                    Comp: (props: any) => Component({ ...previewProps, ...(props || {}) })
+                  }))
+                : React_r.createElement(RuntimeErrorBoundary, null, React_r.createElement(Component, previewProps));
 
             const reactMountNode = mountNodeRef.current;
             if (!reactMountNode) {

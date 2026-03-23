@@ -11,6 +11,7 @@ export default function SignupPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [inviteToken, setInviteToken] = useState('');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
@@ -19,6 +20,17 @@ export default function SignupPage() {
       void router.replace('/builder/new');
     }
   }, [isAuthenticated, router]);
+
+  useEffect(() => {
+    const token = String(router.query.inviteToken || router.query.token || '').trim();
+    const invitedEmail = String(router.query.email || '').trim();
+    if (token) {
+      setInviteToken(token);
+    }
+    if (invitedEmail && !email) {
+      setEmail(invitedEmail);
+    }
+  }, [router.query.inviteToken, router.query.token, router.query.email, email]);
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -32,7 +44,7 @@ export default function SignupPage() {
     }
 
     try {
-      await register(name, email, password, confirmPassword);
+      await register(name, email, password, confirmPassword, inviteToken || undefined);
       await router.push('/builder/new');
     } catch (err: any) {
       if (err?.code === 'ERR_NETWORK') {
@@ -50,6 +62,11 @@ export default function SignupPage() {
       <div className="mx-auto w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
         <h1 className="text-2xl font-bold text-slate-900">Create your IDEA account</h1>
         <p className="mt-1 text-sm text-slate-600">Start generating full-stack projects in minutes.</p>
+        {inviteToken && (
+          <p className="mt-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
+            Team invite detected. After signup, you will be added to the invited team automatically.
+          </p>
+        )}
 
         <form onSubmit={handleSubmit} className="mt-6 space-y-4">
           <div>

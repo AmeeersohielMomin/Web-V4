@@ -6,8 +6,6 @@ import { vercelService } from './vercel.service';
 import { githubService } from './github.service';
 import { railwayService } from './railway.service';
 
-type UserPlan = 'free' | 'starter' | 'pro' | 'team';
-
 function parseGitHubRepo(url: string): { owner: string; repo: string } | null {
   const match = url.match(/github\.com\/([^/]+)\/([^/?#]+)/i);
   if (!match) {
@@ -20,28 +18,80 @@ function parseGitHubRepo(url: string): { owner: string; repo: string } | null {
   };
 }
 
-async function getUserPlan(userId: string): Promise<UserPlan> {
-  const user = await PlatformUser.findById(userId).select('plan');
-  return (user?.plan as UserPlan) || 'free';
-}
 
 function getFrontendBase(): string {
   const raw = process.env.FRONTEND_URL || 'http://localhost:3000';
   return raw.split(',')[0].trim();
 }
 
+function resolveGithubOauthConfig() {
+  const clientId = String(
+    process.env.GITHUB_CLIENT_ID || process.env.GITHUB_OAUTH_CLIENT_ID || ''
+  ).trim();
+  const clientSecret = String(
+    process.env.GITHUB_CLIENT_SECRET || process.env.GITHUB_OAUTH_CLIENT_SECRET || ''
+  ).trim();
+  const callback = String(
+    process.env.GITHUB_CALLBACK_URL ||
+      process.env.GITHUB_OAUTH_CALLBACK_URL ||
+      `${getFrontendBase().replace('3000', '5000')}/api/deploy/github/callback`
+  ).trim();
+
+  return { clientId, clientSecret, callback };
+}
+
+async function getProjectWithDeployAccess(
+  projectId: string,
+  userId: string,
+  requireWrite = true
+) {
+  const user = await PlatformUser.findById(userId).select('teamId teamRole');
+  const teamId = user?.teamId ? String(user.teamId) : null;
+
+  const project = await PlatformProject.findById(projectId);
+  if (!project) {
+    return { project: null as any, error: 'Project not found', status: 404 };
+  }
+
+  if (!project.teamId && teamId && String(project.userId) !== String(userId)) {
+    const owner = await PlatformUser.findById(project.userId).select('teamId');
+    const ownerTeamId = owner?.teamId ? String(owner.teamId) : null;
+    if (ownerTeamId && ownerTeamId === teamId) {
+      project.teamId = owner?.teamId;
+      await project.save();
+    }
+  }
+
+  const isOwner = String(project.userId) === String(userId);
+  const isTeamMatch = !!(project.teamId && teamId && String(project.teamId) === teamId);
+  if (!isOwner && !isTeamMatch) {
+    return { project: null as any, error: 'Project not found', status: 404 };
+  }
+
+  const role = isOwner ? 'owner' : ((user?.teamRole as string) || 'viewer');
+  const canWrite = role === 'owner' || role === 'editor';
+
+  if (requireWrite && !canWrite) {
+    return {
+      project: null as any,
+      error: 'You do not have permission to deploy this team project',
+      status: 403
+    };
+  }
+
+  return { project, error: null, status: 200 };
+}
+
 export class DeployController {
   githubOauthStart = async (req: Request, res: Response) => {
-    const clientId = process.env.GITHUB_CLIENT_ID;
-    const callback =
-      process.env.GITHUB_CALLBACK_URL ||
-      `${getFrontendBase().replace('3000', '5000')}/api/deploy/github/callback`;
+    const { clientId, callback } = resolveGithubOauthConfig();
 
     if (!clientId) {
       return res.status(400).json({
         success: false,
         data: null,
-        error: 'GitHub OAuth is not configured on this server'
+        error:
+          'GitHub OAuth is not configured on this server. Set GITHUB_CLIENT_ID (or GITHUB_OAUTH_CLIENT_ID) and restart backend.'
       });
     }
 
@@ -57,8 +107,7 @@ export class DeployController {
 
   githubOauthCallback = async (req: Request, res: Response) => {
     const code = String(req.query.code || '');
-    const clientId = process.env.GITHUB_CLIENT_ID;
-    const clientSecret = process.env.GITHUB_CLIENT_SECRET;
+    const { clientId, clientSecret } = resolveGithubOauthConfig();
 
     if (!code || !clientId || !clientSecret) {
       return res.status(400).send('GitHub OAuth failed: missing code or server config.');
@@ -119,15 +168,6 @@ export class DeployController {
       };
       const userId = (req as any).userId as string;
 
-      const plan = await getUserPlan(userId);
-      if (plan === 'free') {
-        return res.status(403).json({
-          success: false,
-          data: null,
-          error: 'Upgrade to Starter to deploy to Vercel'
-        });
-      }
-
       if (!vercelToken) {
         return res.status(400).json({
           success: false,
@@ -153,10 +193,11 @@ export class DeployController {
         });
       }
 
-      const project = await PlatformProject.findOne({ _id: projectId, userId });
-      if (!project) {
-        return res.status(404).json({ success: false, data: null, error: 'Project not found' });
+      const access = await getProjectWithDeployAccess(projectId, userId, true);
+      if (!access.project) {
+        return res.status(access.status).json({ success: false, data: null, error: access.error });
       }
+      const project = access.project;
 
       const result = await vercelService.deployFrontend(
         vercelToken,
@@ -228,15 +269,6 @@ export class DeployController {
       };
       const userId = (req as any).userId as string;
 
-      const plan = await getUserPlan(userId);
-      if (plan === 'free') {
-        return res.status(403).json({
-          success: false,
-          data: null,
-          error: 'Upgrade to Starter to push to GitHub'
-        });
-      }
-
       if (!githubToken) {
         return res.status(400).json({
           success: false,
@@ -262,10 +294,11 @@ export class DeployController {
         });
       }
 
-      const project = await PlatformProject.findOne({ _id: projectId, userId });
-      if (!project) {
-        return res.status(404).json({ success: false, data: null, error: 'Project not found' });
+      const access = await getProjectWithDeployAccess(projectId, userId, true);
+      if (!access.project) {
+        return res.status(access.status).json({ success: false, data: null, error: access.error });
       }
+      const project = access.project;
 
       const result = await githubService.pushToGitHub(
         githubToken,
@@ -306,15 +339,6 @@ export class DeployController {
       };
       const userId = (req as any).userId as string;
 
-      const plan = await getUserPlan(userId);
-      if (plan !== 'pro' && plan !== 'team') {
-        return res.status(403).json({
-          success: false,
-          data: null,
-          error: 'Upgrade to Pro to deploy to Railway'
-        });
-      }
-
       if (!railwayToken) {
         return res.status(400).json({
           success: false,
@@ -331,10 +355,11 @@ export class DeployController {
         });
       }
 
-      const project = await PlatformProject.findOne({ _id: projectId, userId });
-      if (!project) {
-        return res.status(404).json({ success: false, data: null, error: 'Project not found' });
+      const access = await getProjectWithDeployAccess(projectId, userId, true);
+      if (!access.project) {
+        return res.status(access.status).json({ success: false, data: null, error: access.error });
       }
+      const project = access.project;
 
       const verified = await railwayService.verifyToken(railwayToken);
       if (!verified.valid) {
@@ -419,10 +444,13 @@ export class DeployController {
 
   getAllDeployStatus = async (req: Request, res: Response) => {
     try {
-      const project = await PlatformProject.findOne({
-        _id: req.params.projectId,
-        userId: (req as any).userId
-      }).select(
+      const userId = (req as any).userId as string;
+      const access = await getProjectWithDeployAccess(req.params.projectId, userId, false);
+      if (!access.project) {
+        return res.status(access.status).json({ success: false, data: null, error: access.error });
+      }
+
+      const project = await PlatformProject.findById(access.project._id).select(
         'name vercelDeployUrl githubRepoUrl railwayServiceUrl vercelDeployId railwayServiceId lastDeployedAt'
       );
 

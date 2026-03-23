@@ -1,8 +1,16 @@
 import archiver from 'archiver';
 import { Response } from 'express';
 import { PlatformProject } from './platform-project.model';
+import { PlatformUser } from '../platform-auth/platform-user.model';
 
 type GeneratedFile = { path: string; content: string; language?: string };
+type ProjectAccessRole = 'owner' | 'editor' | 'viewer' | null;
+type ReadableAccessRole = 'owner' | 'editor' | 'viewer';
+
+type UserTeamContext = {
+  teamId: string | null;
+  teamRole: 'owner' | 'editor' | 'viewer' | null;
+};
 
 function normalizeFiles(files: GeneratedFile[]) {
   return (Array.isArray(files) ? files : [])
@@ -30,6 +38,80 @@ function normalizeFiles(files: GeneratedFile[]) {
 }
 
 export class PlatformProjectsService {
+  private async getUserTeamContext(userId: string): Promise<UserTeamContext> {
+    const user = await PlatformUser.findById(userId).select('teamId teamRole');
+    return {
+      teamId: user?.teamId ? String(user.teamId) : null,
+      teamRole: (user?.teamRole as UserTeamContext['teamRole']) || null
+    };
+  }
+
+  private resolveProjectAccessRole(project: any, userId: string, userTeam: UserTeamContext): ProjectAccessRole {
+    if (String(project?.userId || '') === String(userId)) {
+      return 'owner';
+    }
+
+    const projectTeamId = project?.teamId ? String(project.teamId) : null;
+    if (projectTeamId && userTeam.teamId && projectTeamId === userTeam.teamId) {
+      return userTeam.teamRole || 'viewer';
+    }
+
+    return null;
+  }
+
+  private async getProjectWithAccess(projectId: string, userId: string): Promise<{ project: any; role: ProjectAccessRole }> {
+    const userTeam = await this.getUserTeamContext(userId);
+    const project = await PlatformProject.findById(projectId);
+    if (!project) {
+      throw new Error('Project not found');
+    }
+
+    // Backward compatibility: old projects may not have teamId populated.
+    if (!project.teamId && userTeam.teamId && String(project.userId) !== String(userId)) {
+      const owner = await PlatformUser.findById(project.userId).select('teamId');
+      const ownerTeamId = owner?.teamId ? String(owner.teamId) : null;
+      if (ownerTeamId && ownerTeamId === userTeam.teamId) {
+        project.teamId = owner?.teamId;
+        await project.save();
+      }
+    }
+
+    const role = this.resolveProjectAccessRole(project, userId, userTeam);
+    if (!role) {
+      throw new Error('Project not found');
+    }
+
+    return { project, role };
+  }
+
+  private ensureWriteAccess(role: ProjectAccessRole) {
+    if (role !== 'owner' && role !== 'editor') {
+      throw new Error('You do not have permission to modify this project');
+    }
+  }
+
+  private ensureOwnerAccess(role: ProjectAccessRole) {
+    if (role !== 'owner') {
+      throw new Error('Only the project owner can perform this action');
+    }
+  }
+
+  private buildAccessMeta(project: any, role: ProjectAccessRole, userId: string) {
+    const safeRole: ReadableAccessRole = (role || 'viewer') as ReadableAccessRole;
+    const isOwner = safeRole === 'owner';
+    const canWrite = safeRole === 'owner' || safeRole === 'editor';
+
+    return {
+      accessRole: safeRole,
+      isOwner,
+      canWrite,
+      canDelete: isOwner,
+      canPublish: isOwner,
+      canDeploy: canWrite,
+      isTeamProject: !!(project?.teamId && String(project?.userId || '') !== String(userId))
+    };
+  }
+
   async createProject(
     userId: string,
     data: {
@@ -42,14 +124,23 @@ export class PlatformProjectsService {
       description?: string;
     }
   ) {
-    return PlatformProject.create({ userId, ...data, status: 'generating' });
+    const user = await PlatformUser.findById(userId).select('teamId');
+    return PlatformProject.create({
+      userId,
+      teamId: user?.teamId || null,
+      ...data,
+      status: 'generating'
+    });
   }
 
-  async saveFiles(projectId: string, files: GeneratedFile[], prompt?: string) {
+  async saveFiles(projectId: string, userId: string, files: GeneratedFile[], prompt?: string) {
+    const access = await this.getProjectWithAccess(projectId, userId);
+    this.ensureWriteAccess(access.role);
+
     const normalizedFiles = normalizeFiles(files);
 
     // Get current project to determine version number
-    const project = await PlatformProject.findById(projectId);
+    const project = access.project;
     const versionNumber = project ? (project.currentVersion || 0) + 1 : 1;
 
     // Save version snapshot
@@ -78,8 +169,9 @@ export class PlatformProjectsService {
   }
 
   async restoreVersion(projectId: string, userId: string, versionNumber: number) {
-    const project = await PlatformProject.findOne({ _id: projectId, userId });
-    if (!project) throw new Error('Project not found');
+    const access = await this.getProjectWithAccess(projectId, userId);
+    this.ensureWriteAccess(access.role);
+    const project = access.project;
 
     const version = (project.versions as any[])?.find(
       (v: any) => v.versionNumber === versionNumber
@@ -98,9 +190,12 @@ export class PlatformProjectsService {
   }
 
   async getVersionHistory(projectId: string, userId: string) {
-    const project = await PlatformProject.findOne({ _id: projectId, userId })
+    const access = await this.getProjectWithAccess(projectId, userId);
+    const project = await PlatformProject.findById(access.project._id)
       .select('versions currentVersion name');
-    if (!project) throw new Error('Project not found');
+    if (!project) {
+      throw new Error('Project not found');
+    }
 
     return {
       currentVersion: project.currentVersion,
@@ -119,8 +214,11 @@ export class PlatformProjectsService {
     userId: string,
     entry: { type: 'generate' | 'refine'; prompt: string }
   ) {
+    const access = await this.getProjectWithAccess(projectId, userId);
+    this.ensureWriteAccess(access.role);
+
     return PlatformProject.findOneAndUpdate(
-      { _id: projectId, userId },
+      { _id: projectId },
       {
         $push: {
           chatHistory: {
@@ -135,24 +233,43 @@ export class PlatformProjectsService {
   }
 
   async listUserProjects(userId: string) {
-    return PlatformProject.find({ userId })
+    const userTeam = await this.getUserTeamContext(userId);
+    const query: any = { userId };
+
+    if (userTeam.teamId) {
+      query.$or = [{ userId }, { teamId: userTeam.teamId }];
+    }
+
+    const projects = await PlatformProject.find(query)
       .select(
-        'name modules template backend status fileCount createdAt updatedAt vercelDeployUrl githubRepoUrl railwayServiceUrl'
+        'userId teamId name modules template backend status fileCount createdAt updatedAt vercelDeployUrl githubRepoUrl railwayServiceUrl isPublic tags'
       )
       .sort({ updatedAt: -1 })
       .limit(50);
+
+    return projects.map((project: any) => {
+      const role = this.resolveProjectAccessRole(project, userId, userTeam);
+      const access = this.buildAccessMeta(project, role, userId);
+      return {
+        ...project.toObject(),
+        ...access
+      };
+    });
   }
 
   async getProject(projectId: string, userId: string) {
-    const project = await PlatformProject.findOne({ _id: projectId, userId });
-    if (!project) {
-      throw new Error('Project not found');
-    }
-    return project;
+    const access = await this.getProjectWithAccess(projectId, userId);
+    return {
+      ...access.project.toObject(),
+      ...this.buildAccessMeta(access.project, access.role, userId)
+    };
   }
 
   async deleteProject(projectId: string, userId: string) {
-    const result = await PlatformProject.deleteOne({ _id: projectId, userId });
+    const access = await this.getProjectWithAccess(projectId, userId);
+    this.ensureOwnerAccess(access.role);
+
+    const result = await PlatformProject.deleteOne({ _id: projectId });
     if (result.deletedCount === 0) {
       throw new Error('Project not found');
     }
@@ -183,8 +300,11 @@ export class PlatformProjectsService {
   }
 
   async togglePublic(projectId: string, userId: string, isPublic: boolean) {
+    const access = await this.getProjectWithAccess(projectId, userId);
+    this.ensureOwnerAccess(access.role);
+
     const project = await PlatformProject.findOneAndUpdate(
-      { _id: projectId, userId },
+      { _id: projectId },
       { isPublic },
       { new: true }
     );
@@ -196,8 +316,11 @@ export class PlatformProjectsService {
     const template = await PlatformProject.findOne({ _id: templateId, isPublic: true });
     if (!template) throw new Error('Template not found');
 
+    const user = await PlatformUser.findById(userId).select('teamId');
+
     const clone = await PlatformProject.create({
       userId,
+      teamId: user?.teamId || null,
       name: newName || `${template.name}-clone`,
       description: template.description,
       modules: template.modules,
@@ -237,7 +360,7 @@ Generated by IDEA Platform on ${new Date(project.createdAt).toLocaleDateString()
 ## Stack
 - Template: ${project.template}
 - Backend: ${project.backend}
-- Modules: ${project.modules.join(', ')}
+- Modules: ${Array.isArray(project.modules) ? project.modules.join(', ') : ''}
 
 ## Setup
 

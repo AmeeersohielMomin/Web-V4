@@ -2,28 +2,29 @@ import OpenAI from 'openai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import Anthropic from '@anthropic-ai/sdk';
 import { randomUUID } from 'crypto';
+import { jsonrepair } from 'jsonrepair';
 import {
     buildFullstackPrompt,
     buildDesignToCodePrompt,
     buildRefinePrompt,
     buildRequirementsQuestionsPrompt,
-    buildRequirementsCompilePrompt
+    buildRequirementsCompilePrompt,
 } from './ai.prompts';
 import type {
     NonStreamingParams,
     RequirementsQuestion,
     RequirementsAnswer,
     RequirementsDocument,
-    QuestionsResponse
+    QuestionsResponse,
 } from './ai.types';
 import { track } from '../../utils/telemetry';
 
-export type AIProvider = 'openai' | 'gemini' | 'anthropic' | 'ollama' | 'nvidia';
+export type AIProvider = 'openai' | 'gemini' | 'anthropic' | 'ollama' | 'nvidia' | 'github';
 
 export interface GenerateRequest {
     provider: AIProvider;
-    apiKey?: string;       // User-provided key (BYOK) — optional for free tier
-    model?: string;        // Specific model override
+    apiKey?: string;
+    model?: string;
     userPrompt: string;
     selectedModules: string[];
     projectName?: string;
@@ -46,72 +47,84 @@ export interface RefineRequest {
     refinementRequest: string;
 }
 
-// Default models per provider
+export interface ProjectChatRequest {
+    provider: AIProvider;
+    apiKey?: string;
+    model?: string;
+    message: string;
+    projectContext?: {
+        projectName?: string;
+        description?: string;
+        fileCount?: number;
+        keyFiles?: string[];
+        modules?: string[];
+    };
+}
+
 const DEFAULT_MODELS: Record<AIProvider, string> = {
     openai: 'gpt-4.1',
-    gemini: 'gemini-2.5-flash',   // Most reliable model, works on free-tier API key
+    gemini: 'gemini-2.5-flash',
     anthropic: 'claude-sonnet-4-20250514',
     ollama: 'llama3.2',
-    nvidia: 'nvidia/nemotron-3-super-120b-a12b'
+    nvidia: 'nvidia/nemotron-3-super-120b-a12b',
+    github: 'openai/gpt-4.1',
 };
 
 const NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com/v1';
+const GITHUB_MODELS_BASE_URL = 'https://models.github.ai/inference';
+const GITHUB_MODELS_API_VERSION = process.env.GITHUB_MODELS_API_VERSION || '2026-03-10';
 
 const GEMINI_PLATFORM_FALLBACK_MODELS = [
     'gemini-2.5-flash',
     'gemini-2.5-flash-lite',
     'gemini-2.0-flash-lite',
-    'gemini-2.0-flash'
+    'gemini-2.0-flash',
 ];
 
+// FIX: Default timeout for provider calls to prevent hung connections
+const DEFAULT_GENERATION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+const DEFAULT_NONSTREAMING_TIMEOUT_MS = 60 * 1000;    // 1 minute
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TIMEOUT WRAPPER
+// FIX: Prevents Ollama / NVIDIA / slow providers from hanging SSE connections.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    let timeoutHandle: NodeJS.Timeout;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+            reject(new Error(`[${label}] Request timed out after ${ms / 1000}s. The model may be overloaded or unavailable.`));
+        }, ms);
+    });
+    return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutHandle));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JSON PARSING HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
 function stripCodeFences(text: string): string {
-    return text
-        .replace(/```json\n?/gi, '')
-        .replace(/```\n?/g, '')
-        .trim();
+    return text.replace(/```json\n?/gi, '').replace(/```\n?/g, '').trim();
 }
 
 function extractFirstJsonObject(text: string): string {
     const start = text.indexOf('{');
     if (start === -1) return text;
 
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-
+    let depth = 0, inString = false, escaped = false;
     for (let i = start; i < text.length; i++) {
         const ch = text[i];
-
         if (inString) {
-            if (escaped) {
-                escaped = false;
-                continue;
-            }
-            if (ch === '\\') {
-                escaped = true;
-                continue;
-            }
-            if (ch === '"') {
-                inString = false;
-            }
+            if (escaped) { escaped = false; continue; }
+            if (ch === '\\') { escaped = true; continue; }
+            if (ch === '"') inString = false;
             continue;
         }
-
-        if (ch === '"') {
-            inString = true;
-            continue;
-        }
-
+        if (ch === '"') { inString = true; continue; }
         if (ch === '{') depth++;
-        if (ch === '}') {
-            depth--;
-            if (depth === 0) {
-                return text.slice(start, i + 1);
-            }
-        }
+        if (ch === '}') { depth--; if (depth === 0) return text.slice(start, i + 1); }
     }
-
-    // Fallback for truncated JSON: return from first object brace
     return text.slice(start);
 }
 
@@ -122,20 +135,46 @@ function parseJsonLenient<T>(raw: string): T {
         .replace(/,\s*([}\]])/g, '$1')
         .trim();
 
-    return JSON.parse(cleaned) as T;
+    const attempts: string[] = [];
+    if (cleaned) attempts.push(cleaned);
+
+    try {
+        const repaired = jsonrepair(cleaned);
+        if (repaired && repaired !== cleaned) attempts.push(repaired);
+    } catch {}
+
+    const fallback = stripCodeFences(String(raw || '')).trim();
+    if (fallback && !attempts.includes(fallback)) {
+        attempts.push(fallback);
+        try {
+            const fr = jsonrepair(fallback);
+            if (fr && !attempts.includes(fr)) attempts.push(fr);
+        } catch {}
+    }
+
+    let lastError: unknown = null;
+    for (const candidate of attempts) {
+        try { return JSON.parse(candidate) as T; }
+        catch (err) { lastError = err; }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error('Failed to parse model JSON output.');
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RESPONSE NORMALISERS
+// ─────────────────────────────────────────────────────────────────────────────
 
 function normalizeQuestionsResponse(parsed: QuestionsResponse): QuestionsResponse {
     const safeQuestions: RequirementsQuestion[] = Array.isArray(parsed.questions)
         ? parsed.questions
-            .map((q: any, index: number): RequirementsQuestion => ({
-                id: String(q?.id || `q${index + 1}`),
+            .map((q: any, i: number): RequirementsQuestion => ({
+                id: String(q?.id || `q${i + 1}`),
                 question: String(q?.question || '').trim(),
                 hint: q?.hint ? String(q.hint) : undefined,
                 category: ['features', 'design', 'users', 'technical', 'scope'].includes(String(q?.category))
-                    ? q.category
-                    : 'features',
-                required: Boolean(q?.required)
+                    ? q.category : 'features',
+                required: Boolean(q?.required),
             }))
             .filter((q: RequirementsQuestion) => q.question.length > 0)
         : [];
@@ -143,11 +182,17 @@ function normalizeQuestionsResponse(parsed: QuestionsResponse): QuestionsRespons
     return {
         appType: String(parsed.appType || 'other'),
         projectName: String(parsed.projectName || 'my-app').toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 30),
-        questions: safeQuestions.slice(0, 5)
+        questions: safeQuestions.slice(0, 5),
     };
 }
 
 function normalizeRequirementsDocument(parsed: RequirementsDocument): RequirementsDocument {
+    const rawSummary = String(parsed.compiledSummary || '').trim();
+    const fullScopeSummary = rawSummary
+        .replace(/\b(first\s+release|mvp\s+launch|mvp|phase\s*1|phase\s*one|beta\s+launch)\b/gi, 'full production build')
+        .replace(/\s+/g, ' ')
+        .trim();
+
     return {
         originalPrompt: String(parsed.originalPrompt || ''),
         projectName: String(parsed.projectName || 'my-app').toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 30),
@@ -158,22 +203,166 @@ function normalizeRequirementsDocument(parsed: RequirementsDocument): Requiremen
             : [],
         designPreference: String(parsed.designPreference || 'professional and modern'),
         themeMode: ['light', 'dark', 'hybrid', 'any'].includes(String(parsed.themeMode))
-            ? parsed.themeMode
-            : 'any',
-        scale: ['personal', 'startup', 'enterprise'].includes(String(parsed.scale))
-            ? parsed.scale
-            : 'personal',
+            ? (String(parsed.themeMode) === 'any' ? 'light' : parsed.themeMode)
+            : 'light',
+        scale: ['personal', 'startup', 'enterprise'].includes(String(parsed.scale)) ? parsed.scale : 'personal',
         techPreferences: String(parsed.techPreferences || ''),
         additionalNotes: String(parsed.additionalNotes || ''),
         answers: Array.isArray(parsed.answers)
             ? parsed.answers.map((a: any) => ({
                 questionId: String(a?.questionId || ''),
                 question: String(a?.question || ''),
-                answer: String(a?.answer || '')
+                answer: String(a?.answer || ''),
             }))
             : [],
-        compiledSummary: String(parsed.compiledSummary || '')
+        compiledSummary: fullScopeSummary,
     };
+}
+
+function parseQuestionsResponseFromRaw(raw: string): QuestionsResponse {
+    const parsed = parseJsonLenient<any>(raw);
+    const candidate = parsed?.questions ? parsed
+        : parsed?.data?.questions ? parsed.data
+            : parsed?.result?.questions ? parsed.result
+                : parsed;
+    return normalizeQuestionsResponse(candidate as QuestionsResponse);
+}
+
+function parseRequirementsDocumentFromRaw(raw: string): RequirementsDocument {
+    const parsed = parseJsonLenient<any>(raw);
+    const candidate = parsed?.compiledSummary || parsed?.coreFeatures ? parsed
+        : parsed?.requirements ? parsed.requirements
+            : parsed?.data?.requirements ? parsed.data.requirements
+                : parsed?.result?.requirements ? parsed.result.requirements
+                    : parsed;
+    return normalizeRequirementsDocument(candidate as RequirementsDocument);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FALLBACK REQUIREMENTS BUILDER
+// FIX: Handles any app type — not just the 8 hardcoded ones.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function deriveAppType(userIdea: string): string {
+    const text = userIdea.toLowerCase();
+    const typeChecks: [RegExp, string][] = [
+        [/(asset|estate|provenance|collection|vault|valuation)/, 'asset-management'],
+        [/(ecommerce|e-commerce|store|shop|cart|checkout)/, 'e-commerce'],
+        [/(lms|course|lesson|enrollment|e-learning|learning management)/, 'lms'],
+        [/(healthcare|clinic|hospital|patient|doctor|medical)/, 'healthcare'],
+        [/(fleet|vehicle|driver|truck|logistics|transport)/, 'fleet'],
+        [/(hr|human resource|employee|payroll|attendance)/, 'hr'],
+        [/(job board|recruitment|candidate|resume|hiring)/, 'job-board'],
+        [/(event|conference|concert|ticket|venue|attendee)/, 'events'],
+        [/(real estate|property|listing|agent|rent|house)/, 'real-estate'],
+        [/(blog|cms|article|publish|editorial|news)/, 'blog'],
+        [/(task|kanban|sprint|agile|project management|todo)/, 'task-management'],
+        [/(booking|appointment|schedule|reservation|slot|calendar)/, 'booking'],
+        [/(inventory|stock|warehouse|supply|sku|supplier)/, 'inventory'],
+        [/(finance|expense|budget|transaction|accounting|invoice)/, 'finance'],
+        [/(restaurant|food|menu|table|kitchen|meal|dining)/, 'restaurant'],
+        [/(saas|workspace|team|organization|subscription|multi-tenant)/, 'saas'],
+        [/(social|feed|follow|like|community|network)/, 'social'],
+        [/(dashboard|analytics|metrics|reporting)/, 'dashboard'],
+        [/(booking|appointment)/, 'booking'],
+        [/(marketplace)/, 'marketplace'],
+        [/(portfolio)/, 'portfolio'],
+    ];
+
+    for (const [pattern, type] of typeChecks) {
+        if (pattern.test(text)) return type;
+    }
+    return 'custom';
+}
+
+/**
+ * FIX: Derives meaningful core features for ANY app type using keyword extraction.
+ * No longer returns the useless 'Core application workflow' for unknown domains.
+ */
+function inferCoreFeaturesFromText(text: string, appType: string): string[] {
+    const features = new Set<string>();
+    const lower = text.toLowerCase();
+
+    // Auth always included if mentioned
+    if (/\b(auth|login|signup|register|account)\b/.test(lower)) {
+        features.add('User authentication and account management');
+    }
+
+    // Payment keywords
+    if (/stripe/.test(lower)) features.add('Stripe payment checkout and order processing');
+    else if (/razorpay/.test(lower)) features.add('Razorpay payment gateway integration');
+    else if (/paypal/.test(lower)) features.add('PayPal payment checkout');
+    else if (/(payment|checkout|pay|billing)/.test(lower)) features.add('Payment processing and checkout flow');
+
+    // Communication keywords
+    if (/resend/.test(lower)) features.add('Transactional emails via Resend');
+    else if (/sendgrid/.test(lower)) features.add('Transactional emails via SendGrid');
+    else if (/(email|notification|alert|smtp)/.test(lower)) features.add('Email notifications for key events');
+    if (/sms|twilio|whatsapp/.test(lower)) features.add('SMS notifications via Twilio');
+    if (/(push notification|firebase|fcm)/.test(lower)) features.add('Push notifications via Firebase');
+
+    // File/media keywords
+    if (/cloudinary/.test(lower)) features.add('Image and file uploads via Cloudinary');
+    else if (/s3|aws/.test(lower)) features.add('File uploads to AWS S3');
+    else if (/(upload|image|photo|file|attachment)/.test(lower)) features.add('File and image upload support');
+
+    // Auth keywords
+    if (/(google|github|oauth|social login|sso)/.test(lower)) features.add('Social login via Google/GitHub OAuth');
+    if (/(2fa|two-factor|otp)/.test(lower)) features.add('Two-factor authentication');
+
+    // Real-time keywords
+    if (/(real.?time|chat|socket|live|websocket)/.test(lower)) features.add('Real-time features via WebSockets');
+
+    // Search / filter
+    if (/(search|filter|query|find)/.test(lower)) features.add('Search and filtering capabilities');
+
+    // Admin
+    if (/(admin|management panel|back.?office)/.test(lower)) features.add('Admin dashboard and management panel');
+
+    // Role-based access
+    if (/(role|permission|rbac|access control)/.test(lower)) features.add('Role-based access control');
+
+    // Analytics
+    if (/(analytics|report|stats|metrics|insight)/.test(lower)) features.add('Analytics and reporting dashboard');
+
+    // App-type specific features
+    const appFeatureMap: Record<string, string[]> = {
+        'e-commerce': ['Product catalog and category management', 'Shopping cart and checkout', 'Order tracking and management'],
+        'lms': ['Course and lesson creation', 'Student enrollment and progress tracking', 'Quizzes and assessments'],
+        'healthcare': ['Patient registration and records', 'Appointment scheduling', 'Doctor availability management'],
+        'fleet': ['Vehicle registration and tracking', 'Driver management', 'Trip logging and fuel tracking'],
+        'hr': ['Employee profiles and onboarding', 'Attendance and leave management', 'Payroll processing'],
+        'job-board': ['Job listing creation', 'Candidate applications', 'Interview scheduling'],
+        'events': ['Event creation and management', 'Ticket sales and QR codes', 'Attendee check-in'],
+        'real-estate': ['Property listings with photos', 'Viewing appointment scheduling', 'Agent and client management'],
+        'booking': ['Service catalog and availability', 'Appointment booking flow', 'Booking status management'],
+        'inventory': ['Product and SKU management', 'Stock movement tracking', 'Supplier management'],
+        'finance': ['Account and transaction management', 'Budget tracking', 'Income vs expense reporting'],
+        'restaurant': ['Menu and category management', 'Order management by table', 'Kitchen status tracking'],
+        'saas': ['Workspace and team management', 'Member invitations', 'Activity audit log'],
+        'social': ['Post creation and feed', 'Follow/following system', 'Likes and comments'],
+        'task-management': ['Project and task creation', 'Kanban board with status tracking', 'Task assignment and deadlines'],
+        'blog': ['Article creation and publishing', 'Category and tag management', 'Comment moderation'],
+        'asset-management': ['Asset registry and catalog', 'Provenance and ownership tracking', 'Valuation and insurance management'],
+    };
+
+    const appSpecific = appFeatureMap[appType] || [];
+    for (const f of appSpecific) {
+        if (features.size < 8) features.add(f);
+    }
+
+    // If we still have fewer than 3 features, add generic ones based on the text
+    if (features.size < 3) {
+        // Extract nouns from the text and construct features
+        const words = lower.split(/\W+/).filter(w => w.length > 4);
+        const uniqueWords = [...new Set(words)].slice(0, 3);
+        for (const w of uniqueWords) {
+            if (features.size >= 6) break;
+            features.add(`${w.charAt(0).toUpperCase() + w.slice(1)} management and tracking`);
+        }
+    }
+
+    return Array.from(features).slice(0, 8);
 }
 
 function buildFallbackRequirementsDocument(params: {
@@ -184,69 +373,55 @@ function buildFallbackRequirementsDocument(params: {
 }): RequirementsDocument {
     const promptText = String(params.originalPrompt || '').trim();
     const answersText = params.answers.map(a => String(a.answer || '')).join(' ');
-    const allText = `${promptText} ${answersText}`.toLowerCase();
+    const allText = `${promptText} ${answersText}`;
     const appType = deriveAppType(promptText);
 
     const suppliedName = String(params.projectName || '').toLowerCase();
     const shouldRegenerateName = !suppliedName || suppliedName.startsWith('build-') || suppliedName.length < 5;
-    const inferredNameWords = promptText
-        .toLowerCase()
+    const inferredNameWords = promptText.toLowerCase()
         .replace(/[^a-z0-9\s]/g, ' ')
         .split(/\s+/)
-        .filter(w => w && !['a', 'an', 'build', 'create', 'app', 'web', 'modern', 'for', 'with', 'the', 'and', 'in'].includes(w));
+        .filter(w => w && !['a', 'an', 'build', 'create', 'app', 'web', 'modern', 'for', 'with', 'the', 'and', 'in', 'make'].includes(w));
     const inferredName = inferredNameWords.slice(0, 4).join('-').slice(0, 30);
     const normalizedProjectName = (shouldRegenerateName ? inferredName : suppliedName)
-        .replace(/[^a-z0-9-]/g, '-')
-        .replace(/-+/g, '-')
-        .replace(/^-|-$/g, '')
-        .slice(0, 30) || 'my-app';
+        .replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 30) || 'my-app';
 
-    const coreFeatures = new Set<string>();
-    if (params.selectedModules.includes('auth')) coreFeatures.add('User authentication');
-    if (appType === 'e-commerce') coreFeatures.add('Product catalog and category browsing');
-    if (allText.includes('search') || allText.includes('filter')) coreFeatures.add('Product search and filtering');
-    if (allText.includes('cart')) coreFeatures.add('Shopping cart');
-    if (allText.includes('payment') || allText.includes('stripe') || allText.includes('checkout')) coreFeatures.add('Checkout and payment flow');
-    if (allText.includes('admin') || allText.includes('dashboard')) coreFeatures.add('Admin dashboard');
-    if (allText.includes('inventory')) coreFeatures.add('Inventory management');
-    if (allText.includes('order track') || allText.includes('order status')) coreFeatures.add('Order tracking and status updates');
-    if (allText.includes('email') || allText.includes('notification')) coreFeatures.add('Email notifications');
-    if (coreFeatures.size === 0) coreFeatures.add('Core application workflow');
+    // FIX: Use the proper feature inference for any app type
+    const coreFeatures = inferCoreFeaturesFromText(allText, appType);
 
-    const wantsDark = allText.includes('dark');
-    const wantsLight = allText.includes('light');
-    const themeMode: RequirementsDocument['themeMode'] = wantsDark && !wantsLight
-        ? 'dark'
-        : wantsLight && !wantsDark
-            ? 'light'
-            : wantsDark && wantsLight
-                ? 'hybrid'
-                : 'any';
+    const wantsDark = /\bdark\b/.test(allText.toLowerCase());
+    const wantsLight = /\blight\b/.test(allText.toLowerCase());
+    const themeMode: RequirementsDocument['themeMode'] = wantsDark && !wantsLight ? 'dark'
+        : wantsLight && !wantsDark ? 'light'
+            : wantsDark && wantsLight ? 'hybrid'
+                : 'light';
 
-    const scale: RequirementsDocument['scale'] = allText.includes('enterprise')
-        ? 'enterprise'
-        : allText.includes('startup') || allText.includes('launch') || allText.includes('mvp')
-            ? 'startup'
+    const scale: RequirementsDocument['scale'] = /enterprise/.test(allText.toLowerCase()) ? 'enterprise'
+        : /(startup|launch|mvp)/.test(allText.toLowerCase()) ? 'startup'
             : 'personal';
 
-    const designPreference = allText.includes('minimal')
-        ? 'clean minimal modern'
-        : allText.includes('modern') || allText.includes('professional')
-            ? 'professional and modern'
+    const designPreference = /minimal/.test(allText.toLowerCase()) ? 'clean minimal modern'
+        : /(modern|professional)/.test(allText.toLowerCase()) ? 'professional and modern'
             : 'clean and usable';
 
     const techBits: string[] = [];
-    if (allText.includes('stripe')) techBits.push('Stripe');
-    if (allText.includes('postgres')) techBits.push('PostgreSQL');
-    if (allText.includes('mysql')) techBits.push('MySQL');
-    if (allText.includes('mongodb') || allText.includes('mongo')) techBits.push('MongoDB');
-    if (allText.includes('next')) techBits.push('Next.js');
-    if (allText.includes('node') || allText.includes('express')) techBits.push('Node/Express');
+    if (/stripe/.test(allText.toLowerCase())) techBits.push('Stripe');
+    if (/razorpay/.test(allText.toLowerCase())) techBits.push('Razorpay');
+    if (/postgres/.test(allText.toLowerCase())) techBits.push('PostgreSQL');
+    if (/mongodb/.test(allText.toLowerCase())) techBits.push('MongoDB');
+    if (/redis/.test(allText.toLowerCase())) techBits.push('Redis');
+    if (/cloudinary/.test(allText.toLowerCase())) techBits.push('Cloudinary');
+    if (/s3|aws/.test(allText.toLowerCase())) techBits.push('AWS S3');
+    if (/(nodemailer|smtp)/.test(allText.toLowerCase())) techBits.push('Nodemailer');
+    if (/resend/.test(allText.toLowerCase())) techBits.push('Resend');
+    if (/oauth|google|github/.test(allText.toLowerCase())) techBits.push('OAuth');
+    if (/(socket|websocket|real.?time)/.test(allText.toLowerCase())) techBits.push('Socket.io');
+    if (/twilio/.test(allText.toLowerCase())) techBits.push('Twilio');
 
     const userAnswerHint = params.answers.find(a => /who are|users|customers/i.test(a.question))?.answer?.trim() || '';
-    const targetUsers = userAnswerHint || (appType === 'e-commerce' ? 'online retail customers' : 'general users');
+    const targetUsers = userAnswerHint || 'general users';
 
-    const appTypeLabel = appType === 'other' ? 'web app' : appType;
+    const appTypeLabel = appType.replace(/-/g, ' ');
     const appTypeWithArticle = /^[aeiou]/.test(appTypeLabel) ? `an ${appTypeLabel}` : `a ${appTypeLabel}`;
 
     return {
@@ -254,34 +429,160 @@ function buildFallbackRequirementsDocument(params: {
         projectName: normalizedProjectName,
         appType,
         targetUsers,
-        coreFeatures: Array.from(coreFeatures).slice(0, 8),
+        coreFeatures,
         designPreference,
         themeMode,
         scale,
-        techPreferences: techBits.length > 0 ? techBits.join(', ') : '',
+        techPreferences: techBits.length > 0 ? techBits.join(', ') : 'Node.js + Next.js + MongoDB',
         additionalNotes: '',
         answers: params.answers,
-        compiledSummary: `You're building ${appTypeWithArticle} called ${normalizedProjectName} focused on ${targetUsers}. The first release will prioritize ${Array.from(coreFeatures).slice(0, 3).join(', ').toLowerCase()} with a ${themeMode} theme direction.`
+        compiledSummary: `You're building ${appTypeWithArticle} platform focused on ${targetUsers}. This full production build includes ${coreFeatures.slice(0, 3).join(', ').toLowerCase()} with complete ${appTypeLabel} workflows and a ${themeMode} theme from day one.`,
     };
 }
 
-function deriveAppType(userIdea: string): string {
-    const text = userIdea.toLowerCase();
-    if (text.includes('ecommerce') || text.includes('e-commerce') || text.includes('store') || text.includes('shop')) return 'e-commerce';
-    if (text.includes('blog')) return 'blog';
-    if (text.includes('dashboard')) return 'dashboard';
-    if (text.includes('booking') || text.includes('appointment')) return 'booking';
-    if (text.includes('marketplace')) return 'marketplace';
-    if (text.includes('analytics')) return 'analytics';
-    if (text.includes('portfolio')) return 'portfolio';
-    if (text.includes('saas')) return 'saas';
-    return 'other';
+// ─────────────────────────────────────────────────────────────────────────────
+// DOMAIN REBALANCER
+// ─────────────────────────────────────────────────────────────────────────────
+
+function isAuthOnlyIntent(originalPrompt: string, selectedModules: string[]): boolean {
+    const text = String(originalPrompt || '').toLowerCase();
+    const explicitAuthOnly = /\bauth(?:entication)?\s+only\b/.test(text) || /\bonly\s+auth(?:entication)?\b/.test(text);
+    const modules = (selectedModules || []).map(m => String(m || '').toLowerCase()).filter(Boolean);
+    return explicitAuthOnly || (modules.length === 1 && modules[0] === 'auth' && explicitAuthOnly);
+}
+
+function isAuthHeavyFeature(feature: string): boolean {
+    return /(auth|login|signup|password|sso|2fa|webauthn|invite|rbac|role-based access|audit|identity|kyc|session)/.test(String(feature || '').toLowerCase());
+}
+
+function rebalanceRequirementsForDomain(
+    parsed: RequirementsDocument,
+    params: { originalPrompt: string; selectedModules: string[] },
+): RequirementsDocument {
+    if (isAuthOnlyIntent(params.originalPrompt, params.selectedModules)) return parsed;
+
+    const currentFeatures = Array.isArray(parsed.coreFeatures) ? parsed.coreFeatures : [];
+    const nonAuthCount = currentFeatures.filter(f => !isAuthHeavyFeature(f)).length;
+
+    let mergedFeatures = [...currentFeatures];
+    if (nonAuthCount < 3) {
+        const appType = deriveAppType(params.originalPrompt);
+        const inferred = inferCoreFeaturesFromText(params.originalPrompt, appType);
+        mergedFeatures = Array.from(new Set([...inferred, ...currentFeatures])).slice(0, 8);
+    }
+
+    let summary = String(parsed.compiledSummary || '');
+    if (/authentication module/i.test(summary) && mergedFeatures.length > 0) {
+        const appType = parsed.appType || 'web application';
+        const domainLine = mergedFeatures.filter(f => !isAuthHeavyFeature(f)).slice(0, 3).join(', ').toLowerCase();
+        summary = `You're building a production-grade ${appType} platform focused on ${domainLine}. It includes complete domain workflows with enterprise security and premium UX from day one.`;
+    }
+
+    return { ...parsed, coreFeatures: mergedFeatures, compiledSummary: summary };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UTILITY FUNCTIONS
+// ─────────────────────────────────────────────────────────────────────────────
+
+function isQuotaOrRateLimitError(err: unknown): boolean {
+    const msg = String((err as any)?.message || err || '').toLowerCase();
+    return (
+        msg.includes('429') || msg.includes('503') || msg.includes('too many requests') ||
+        msg.includes('quota exceeded') || msg.includes('resource_exhausted') ||
+        msg.includes('service unavailable') || msg.includes('rate limit') || msg.includes('retry in')
+    );
+}
+
+function isUnknownModelError(err: unknown): boolean {
+    const msg = String((err as any)?.message || err || '').toLowerCase();
+    const status = Number((err as any)?.status || (err as any)?.statusCode || 0);
+    return (
+        status === 404 ||
+        msg.includes('unknown model') ||
+        msg.includes('model not found') ||
+        msg.includes('invalid model') ||
+        msg.includes('does not exist')
+    );
+}
+
+function getGitHubModelFallbackChain(primaryModel?: string): string[] {
+    const primary = normalizeModelForProvider('github', primaryModel) || DEFAULT_MODELS.github;
+    const fallbacks = [
+        primary,
+        'openai/gpt-4.1',
+        'meta/llama-4-maverick',
+    ];
+    return Array.from(new Set(fallbacks.filter(Boolean)));
+}
+
+function getPlatformGeminiKey(): string {
+    const key = process.env.GEMINI_API_KEY;
+    if (!key) throw new Error('Platform AI service is temporarily unavailable. Please provide your own API key.');
+    return key;
+}
+
+function safeGeminiModel(requestedModel: string | undefined, usingPlatformKey: boolean): string {
+    if (!usingPlatformKey) return requestedModel || DEFAULT_MODELS.gemini;
+    if (requestedModel && GEMINI_PLATFORM_FALLBACK_MODELS.includes(requestedModel)) return requestedModel;
+    return DEFAULT_MODELS.gemini;
+}
+
+function getGeminiFallbackChain(primaryModel: string, usingPlatformKey: boolean): string[] {
+    if (!usingPlatformKey) return [primaryModel];
+    return Array.from(new Set([primaryModel, ...GEMINI_PLATFORM_FALLBACK_MODELS]));
+}
+
+function resolveApiKey(provider: AIProvider, userApiKey?: string): string {
+    if (userApiKey && userApiKey.trim()) return userApiKey.trim();
+    if (provider === 'gemini') return getPlatformGeminiKey();
+    if (provider === 'ollama') return '';
+    if (provider === 'nvidia') {
+        const key = process.env.NVIDIA_API_KEY;
+        if (key) return key;
+        throw new Error('An API key is required for NVIDIA NIM.');
+    }
+    if (provider === 'github') {
+        const key = process.env.GITHUB_MODELS_API_KEY || process.env.GITHUB_TOKEN;
+        if (key) return key;
+        throw new Error('A GitHub token is required for GitHub Models.');
+    }
+    throw new Error(`An API key is required for ${provider}.`);
+}
+
+function createGitHubModelsClient(apiKey: string): OpenAI {
+    return new OpenAI({
+        apiKey,
+        baseURL: GITHUB_MODELS_BASE_URL,
+        defaultHeaders: {
+            Accept: 'application/vnd.github+json',
+            'X-GitHub-Api-Version': GITHUB_MODELS_API_VERSION,
+        },
+    });
+}
+
+function normalizeModelForProvider(provider: AIProvider, model?: string): string | undefined {
+    if (!model) return model;
+    const trimmed = model.trim().replace(/^\/+/, '');
+    if (!trimmed) return undefined;
+    if (provider === 'openai') {
+        const normalized = trimmed.replace(/^openai\//i, '');
+        if (/^(gemini|claude|meta\/|nvidia\/|qwen|llama)/i.test(normalized)) return DEFAULT_MODELS.openai;
+        return normalized;
+    }
+    if (provider === 'github') {
+        if (/^[a-z0-9-]+\/[a-z0-9-._]+$/i.test(trimmed)) return trimmed;
+        if (/^gpt-/i.test(trimmed)) return `openai/${trimmed}`;
+        if (/^llama-4-maverick$/i.test(trimmed)) return 'meta/llama-4-maverick';
+        return DEFAULT_MODELS.github;
+    }
+    return trimmed;
 }
 
 function buildJsonRepairPrompt(rawModelOutput: string, schemaDescription: string): string {
     return `You are a strict JSON repair engine.
 
-Your task: convert the following model output into valid JSON matching this schema:
+Convert this model output into valid JSON matching the schema:
 ${schemaDescription}
 
 Rules:
@@ -290,160 +591,179 @@ Rules:
 3. If fields are missing, infer sensible defaults.
 4. Preserve user intent from the original text.
 
-Original model output:
+Original output:
 """
 ${rawModelOutput}
 """`;
 }
 
-function isQuotaOrRateLimitError(err: unknown): boolean {
-    const msg = String((err as any)?.message || err || '').toLowerCase();
-    return (
-        msg.includes('429') ||
-        msg.includes('503') ||
-        msg.includes('too many requests') ||
-        msg.includes('quota exceeded') ||
-        msg.includes('resource_exhausted') ||
-        msg.includes('service unavailable') ||
-        msg.includes('currently experiencing high demand') ||
-        msg.includes('model is overloaded') ||
-        msg.includes('rate limit') ||
-        msg.includes('retry in')
-    );
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// FIX: Improved refine context compression
+// Critical shared files always included; scoring biased toward requested areas.
+// ─────────────────────────────────────────────────────────────────────────────
 
-// Free tier uses platform-managed Gemini key (rate limited)
-function getPlatformGeminiKey(): string {
-    const key = process.env.GEMINI_API_KEY;
-    if (!key) throw new Error('Platform AI service is temporarily unavailable. Please provide your own API key.');
-    return key;
-}
+function compressRefineContextFiles(
+    previousCode: Array<{ path: string; content: string }>,
+    refinementRequest: string,
+): Array<{ path: string; content: string }> {
+    const files = Array.isArray(previousCode) ? previousCode : [];
+    const requestText = String(refinementRequest || '').toLowerCase();
+    const requestTerms = requestText.split(/[^a-z0-9]+/i).filter(term => term.length > 2);
 
-// Safe model resolver: if using platform key (no BYOK), allow only curated
-// platform-supported models to reduce unsupported/paid-only model failures.
-function safeGeminiModel(requestedModel: string | undefined, usingPlatformKey: boolean): string {
-    if (!usingPlatformKey) return requestedModel || DEFAULT_MODELS.gemini;
+    // Critical files always included regardless of score
+    const criticalPaths = new Set([
+        'backend/src/server.ts',
+        'frontend/pages/_app.tsx',
+        'frontend/src/contexts/authcontext.tsx',
+        'backend/src/middleware/auth.ts',
+        'frontend/pages/dashboard.tsx',
+        'frontend/src/components/navbar.tsx',
+    ]);
 
-    // Respect user-selected free-tier compatible Gemini models for platform key usage.
-    if (requestedModel && GEMINI_PLATFORM_FALLBACK_MODELS.includes(requestedModel)) {
-        return requestedModel;
+    const scorePath = (path: string): number => {
+        const p = String(path || '').toLowerCase().replace(/\\/g, '/');
+        if (criticalPaths.has(p)) return 999; // always include critical files
+        let score = 0;
+        if (p.includes('frontend/')) score += 3;
+        if (p.includes('backend/')) score += 2;
+        if (p.includes('/pages/')) score += 3;
+        if (p.includes('service')) score += 2;
+        if (p.includes('controller') || p.includes('routes') || p.includes('schema') || p.includes('model')) score += 1;
+        for (const term of requestTerms) {
+            if (p.includes(term)) score += 6; // heavy bias toward requested module
+        }
+        return score;
+    };
+
+    const sorted = [...files].sort((a, b) => scorePath(b.path) - scorePath(a.path));
+    const maxFiles = 20;
+    const maxCharsPerFile = 1800;
+    const maxTotalChars = 28000;
+
+    let totalChars = 0;
+    const result: Array<{ path: string; content: string }> = [];
+
+    for (const file of sorted.slice(0, maxFiles)) {
+        if (totalChars >= maxTotalChars) break;
+        const content = String(file.content || '');
+        const remaining = Math.max(0, maxTotalChars - totalChars);
+        const cap = Math.min(maxCharsPerFile, remaining);
+        const reduced = content.length > cap
+            ? `${content.slice(0, cap)}\n// ...truncated for token-safe refine context`
+            : content;
+        totalChars += reduced.length;
+        result.push({ path: String(file.path || ''), content: reduced });
     }
 
-    return DEFAULT_MODELS.gemini;
+    return result;
 }
 
-function getGeminiFallbackChain(primaryModel: string, usingPlatformKey: boolean): string[] {
-    if (!usingPlatformKey) return [primaryModel];
-    const chain = [primaryModel, ...GEMINI_PLATFORM_FALLBACK_MODELS];
-    return Array.from(new Set(chain));
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// PROVIDER IMPLEMENTATIONS
+// ─────────────────────────────────────────────────────────────────────────────
 
-function resolveApiKey(provider: AIProvider, userApiKey?: string): string {
-    if (userApiKey && userApiKey.trim()) return userApiKey.trim();
-    // Free tier: only platform-managed Gemini is available without user key
-    if (provider === 'gemini') return getPlatformGeminiKey();
-    // Ollama runs locally — no API key needed
-    if (provider === 'ollama') return '';
-    // NVIDIA NIM: use platform key from env if no user key provided
-    if (provider === 'nvidia') {
-        const nvidiaKey = process.env.NVIDIA_API_KEY;
-        if (nvidiaKey) return nvidiaKey;
-        throw new Error('An API key is required for NVIDIA NIM. Please provide your NVIDIA API key.');
-    }
-    throw new Error(`An API key is required for ${provider}. Please provide your own ${provider} API key.`);
-}
-
-// ─── OpenAI ──────────────────────────────────────────────────
 async function generateWithOpenAI(
     apiKey: string,
     model: string,
     systemPrompt: string,
     userMessage: string,
     onChunk?: (chunk: string) => void,
-    temperature: number = 0.3
+    temperature = 0.3,
 ): Promise<string> {
     const client = new OpenAI({ apiKey });
-    const model_name = model || DEFAULT_MODELS.openai;
+    const modelName = normalizeModelForProvider('openai', model) || DEFAULT_MODELS.openai;
+
+    const timeoutMs = onChunk ? DEFAULT_GENERATION_TIMEOUT_MS : DEFAULT_NONSTREAMING_TIMEOUT_MS;
 
     if (onChunk) {
-        const stream = await client.chat.completions.create({
-            model: model_name,
-            messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userMessage }
-            ],
-            stream: true,
-            temperature,
-            max_tokens: 32768
-        });
-        let fullResponse = '';
-        for await (const chunk of stream) {
-            const text = chunk.choices[0]?.delta?.content || '';
-            fullResponse += text;
-            if (text) onChunk(text);
-        }
-        return fullResponse;
-    } else {
-        const response = await client.chat.completions.create({
-            model: model_name,
-            messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userMessage }
-            ],
-            temperature,
-            max_tokens: 32768
-        });
-        return response.choices[0]?.message?.content || '';
+        return withTimeout(
+            (async () => {
+                const stream = await client.chat.completions.create({
+                    model: modelName,
+                    messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
+                    stream: true, temperature, max_tokens: 32768,
+                });
+                let full = '';
+                for await (const chunk of stream) {
+                    const text = chunk.choices[0]?.delta?.content || '';
+                    full += text;
+                    if (text) onChunk(text);
+                }
+                return full;
+            })(),
+            timeoutMs,
+            `OpenAI/${modelName}`,
+        );
     }
+
+    return withTimeout(
+        (async () => {
+            const response = await client.chat.completions.create({
+                model: modelName,
+                messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
+                temperature, max_tokens: 32768,
+            });
+            return response.choices[0]?.message?.content || '';
+        })(),
+        timeoutMs,
+        `OpenAI/${modelName}`,
+    );
 }
 
-// ─── Gemini ───────────────────────────────────────────────────
 async function generateWithGemini(
     apiKey: string,
     model: string,
     systemPrompt: string,
     userMessage: string,
     onChunk?: (chunk: string) => void,
-    temperature: number = 0.3
+    temperature = 0.3,
 ): Promise<string> {
     const client = new GoogleGenerativeAI(apiKey);
     const generativeModel = client.getGenerativeModel({
         model: model || DEFAULT_MODELS.gemini,
         systemInstruction: systemPrompt,
-        generationConfig: { temperature, maxOutputTokens: 65536 }
+        generationConfig: { temperature, maxOutputTokens: 65536 },
     });
+
+    const timeoutMs = onChunk ? DEFAULT_GENERATION_TIMEOUT_MS : DEFAULT_NONSTREAMING_TIMEOUT_MS;
 
     try {
         if (onChunk) {
-            const result = await generativeModel.generateContentStream(userMessage);
-            let fullText = '';
-            for await (const chunk of result.stream) {
-                const text = chunk.text();
-                fullText += text;
-                if (text) onChunk(text);
-            }
-            return fullText;
-        } else {
-            const result = await generativeModel.generateContent(userMessage);
-            return result.response.text();
+            return await withTimeout(
+                (async () => {
+                    const result = await generativeModel.generateContentStream(userMessage);
+                    let fullText = '';
+                    for await (const chunk of result.stream) {
+                        const text = chunk.text();
+                        fullText += text;
+                        if (text) onChunk(text);
+                    }
+                    return fullText;
+                })(),
+                timeoutMs,
+                `Gemini/${model}`,
+            );
         }
+        return await withTimeout(
+            generativeModel.generateContent(userMessage).then(r => r.response.text()),
+            timeoutMs,
+            `Gemini/${model}`,
+        );
     } catch (err: any) {
-        // Parse quota-exceeded errors into human-readable messages
         const msg: string = err?.message || '';
         if (msg.includes('429') || msg.includes('Too Many Requests') || msg.includes('RESOURCE_EXHAUSTED')) {
-            // Extract retry delay if present
             const retryMatch = msg.match(/retry[^\d]*(\d+)s/i);
-            const retryIn = retryMatch ? ` Please retry in ${retryMatch[1]}s.` : '';
+            const retryIn = retryMatch ? ` Retry in ${retryMatch[1]}s.` : '';
             throw new Error(
-                `Gemini API quota exceeded for model "${model || DEFAULT_MODELS.gemini}".${retryIn} ` +
-                `Try switching to a different model (e.g. gemini-2.5-pro with your own key) or wait before retrying. ` +
-                `You can also switch to OpenAI or Claude with your own API key.`
+                `Gemini quota exceeded for "${model}".${retryIn} ` +
+                `Switch to a different model or provide your own API key.`,
             );
         }
         throw err;
     }
 }
 
+// FIX: Deduplicated — single function handles fallback for both streaming and non-streaming
 async function generateWithGeminiWithFallback(
     apiKey: string,
     primaryModel: string,
@@ -451,271 +771,299 @@ async function generateWithGeminiWithFallback(
     userMessage: string,
     onChunk: ((chunk: string) => void) | undefined,
     temperature: number,
-    usingPlatformKey: boolean
+    usingPlatformKey: boolean,
 ): Promise<string> {
     const modelsToTry = getGeminiFallbackChain(primaryModel, usingPlatformKey);
     let lastError: unknown;
     let sawQuotaError = false;
 
-    for (let i = 0; i < modelsToTry.length; i++) {
-        const model = modelsToTry[i];
+    for (const model of modelsToTry) {
         try {
             return await generateWithGemini(apiKey, model, systemPrompt, userMessage, onChunk, temperature);
         } catch (err) {
             lastError = err;
-            if (isQuotaOrRateLimitError(err)) {
-                sawQuotaError = true;
-                continue;
-            }
+            if (isQuotaOrRateLimitError(err)) { sawQuotaError = true; continue; }
             throw err;
         }
     }
 
     if (sawQuotaError) {
         throw new Error(
-            `Gemini free-tier models are currently unavailable or quota-limited (${modelsToTry.join(', ')}). ` +
-            `Please retry shortly, switch Gemini model/provider, or use your own API key.`
+            `Gemini free-tier models are quota-limited (${modelsToTry.join(', ')}). ` +
+            `Please retry shortly or use your own API key.`,
         );
     }
-
-    throw lastError instanceof Error
-        ? lastError
-        : new Error(
-            `Gemini API quota exceeded across available free-tier models (${modelsToTry.join(', ')}). ` +
-            `Please retry shortly, switch Gemini model, or use your own OpenAI/Claude API key.`
-        );
+    throw lastError instanceof Error ? lastError : new Error('Gemini request failed.');
 }
 
-// ─── Anthropic ────────────────────────────────────────────────
 async function generateWithAnthropic(
     apiKey: string,
     model: string,
     systemPrompt: string,
     userMessage: string,
     onChunk?: (chunk: string) => void,
-    temperature: number = 0.3
+    temperature = 0.3,
 ): Promise<string> {
     const client = new Anthropic({ apiKey });
-    const model_name = model || DEFAULT_MODELS.anthropic;
+    const modelName = model || DEFAULT_MODELS.anthropic;
+    const timeoutMs = onChunk ? DEFAULT_GENERATION_TIMEOUT_MS : DEFAULT_NONSTREAMING_TIMEOUT_MS;
 
     if (onChunk) {
-        const stream = await client.messages.stream({
-            model: model_name,
-            max_tokens: 32768,
-            system: systemPrompt,
-            temperature,
-            messages: [{ role: 'user', content: userMessage }]
-        });
-        let fullText = '';
-        for await (const event of stream) {
-            if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-                const text = event.delta.text;
-                fullText += text;
-                onChunk(text);
-            }
-        }
-        return fullText;
-    } else {
-        const response = await client.messages.create({
-            model: model_name,
-            max_tokens: 32768,
-            system: systemPrompt,
-            temperature,
-            messages: [{ role: 'user', content: userMessage }]
-        });
-        const block = response.content[0];
-        return block.type === 'text' ? block.text : '';
+        return withTimeout(
+            (async () => {
+                const stream = await client.messages.stream({
+                    model: modelName, max_tokens: 32768, system: systemPrompt, temperature,
+                    messages: [{ role: 'user', content: userMessage }],
+                });
+                let fullText = '';
+                for await (const event of stream) {
+                    if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+                        const text = event.delta.text;
+                        fullText += text;
+                        onChunk(text);
+                    }
+                }
+                return fullText;
+            })(),
+            timeoutMs,
+            `Anthropic/${modelName}`,
+        );
     }
+
+    return withTimeout(
+        (async () => {
+            const response = await client.messages.create({
+                model: modelName, max_tokens: 32768, system: systemPrompt, temperature,
+                messages: [{ role: 'user', content: userMessage }],
+            });
+            const block = response.content[0];
+            return block.type === 'text' ? block.text : '';
+        })(),
+        timeoutMs,
+        `Anthropic/${modelName}`,
+    );
 }
 
-// ─── Ollama (Local) ───────────────────────────────────────────
 async function generateWithOllama(
     model: string,
     systemPrompt: string,
     userMessage: string,
     onChunk?: (chunk: string) => void,
-    temperature: number = 0.3
+    temperature = 0.3,
 ): Promise<string> {
     const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
     const modelName = model || DEFAULT_MODELS.ollama;
+    const timeoutMs = onChunk ? DEFAULT_GENERATION_TIMEOUT_MS : DEFAULT_NONSTREAMING_TIMEOUT_MS;
 
-    const response = await fetch(`${ollamaUrl}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            model: modelName,
-            messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userMessage }
-            ],
-            stream: !!onChunk,
-            options: { temperature }
-        })
-    });
+    return withTimeout(
+        (async () => {
+            const response = await fetch(`${ollamaUrl}/api/chat`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model: modelName,
+                    messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
+                    stream: !!onChunk,
+                    options: { temperature },
+                }),
+            });
 
-    if (!response.ok) throw new Error(`Ollama error: ${response.statusText}`);
+            if (!response.ok) throw new Error(`Ollama error: ${response.statusText}`);
 
-    if (onChunk && response.body) {
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let fullText = '';
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            const lines = decoder.decode(value).split('\n').filter(Boolean);
-            for (const line of lines) {
-                try {
-                    const json = JSON.parse(line);
-                    const text = json.message?.content || '';
-                    fullText += text;
-                    if (text) onChunk(text);
-                } catch { }
+            if (onChunk && response.body) {
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let fullText = '';
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    const lines = decoder.decode(value).split('\n').filter(Boolean);
+                    for (const line of lines) {
+                        try {
+                            const json = JSON.parse(line);
+                            const text = json.message?.content || '';
+                            fullText += text;
+                            if (text) onChunk(text);
+                        } catch {}
+                    }
+                }
+                return fullText;
             }
-        }
-        return fullText;
-    } else {
-        const data: any = await response.json();
-        return data.message?.content || '';
-    }
+
+            const data: any = await response.json();
+            return data.message?.content || '';
+        })(),
+        timeoutMs,
+        `Ollama/${modelName}`,
+    );
 }
 
-// ─── NVIDIA NIM ───────────────────────────────────────────────
 async function generateWithNvidia(
     apiKey: string,
     model: string,
     systemPrompt: string,
     userMessage: string,
     onChunk?: (chunk: string) => void,
-    temperature: number = 0.3
+    temperature = 0.3,
 ): Promise<string> {
     const client = new OpenAI({ apiKey, baseURL: NVIDIA_BASE_URL });
     const modelName = model || DEFAULT_MODELS.nvidia;
+    const timeoutMs = onChunk ? DEFAULT_GENERATION_TIMEOUT_MS : DEFAULT_NONSTREAMING_TIMEOUT_MS;
 
     if (onChunk) {
-        const stream = await client.chat.completions.create({
-            model: modelName,
-            messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userMessage }
-            ],
-            stream: true,
-            temperature,
-            top_p: 0.7,
-            max_tokens: 65536
-        });
-        let fullResponse = '';
-        for await (const chunk of stream) {
-            const text = chunk.choices[0]?.delta?.content || '';
-            fullResponse += text;
-            if (text) onChunk(text);
-        }
-        return fullResponse;
-    } else {
-        const response = await client.chat.completions.create({
-            model: modelName,
-            messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: userMessage }
-            ],
-            temperature,
-            top_p: 0.7,
-            max_tokens: 65536
-        });
-        return response.choices[0]?.message?.content || '';
+        return withTimeout(
+            (async () => {
+                const stream = await client.chat.completions.create({
+                    model: modelName,
+                    messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
+                    stream: true, temperature, top_p: 0.7, max_tokens: 65536,
+                });
+                let full = '';
+                for await (const chunk of stream) {
+                    const text = chunk.choices[0]?.delta?.content || '';
+                    full += text;
+                    if (text) onChunk(text);
+                }
+                return full;
+            })(),
+            timeoutMs,
+            `NVIDIA/${modelName}`,
+        );
     }
+
+    return withTimeout(
+        (async () => {
+            const response = await client.chat.completions.create({
+                model: modelName,
+                messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
+                temperature, top_p: 0.7, max_tokens: 65536,
+            });
+            return response.choices[0]?.message?.content || '';
+        })(),
+        timeoutMs,
+        `NVIDIA/${modelName}`,
+    );
 }
 
-// ─── Main Router ──────────────────────────────────────────────
+async function generateWithGitHubModels(
+    apiKey: string,
+    model: string,
+    systemPrompt: string,
+    userMessage: string,
+    onChunk?: (chunk: string) => void,
+    temperature = 0.3,
+): Promise<string> {
+    const client = createGitHubModelsClient(apiKey);
+    const timeoutMs = onChunk ? DEFAULT_GENERATION_TIMEOUT_MS : DEFAULT_NONSTREAMING_TIMEOUT_MS;
+    const modelsToTry = getGitHubModelFallbackChain(model);
+    let lastError: unknown = null;
+
+    for (const modelName of modelsToTry) {
+        try {
+            if (onChunk) {
+                return await withTimeout(
+                    (async () => {
+                        const stream = await client.chat.completions.create({
+                            model: modelName,
+                            messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
+                            stream: true, temperature, max_tokens: 32768,
+                        });
+                        let full = '';
+                        for await (const chunk of stream) {
+                            const text = chunk.choices[0]?.delta?.content || '';
+                            full += text;
+                            if (text) onChunk(text);
+                        }
+                        return full;
+                    })(),
+                    timeoutMs,
+                    `GitHub/${modelName}`,
+                );
+            }
+
+            return await withTimeout(
+                (async () => {
+                    const response = await client.chat.completions.create({
+                        model: modelName,
+                        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
+                        temperature, max_tokens: 32768,
+                    });
+                    return response.choices[0]?.message?.content || '';
+                })(),
+                timeoutMs,
+                `GitHub/${modelName}`,
+            );
+        } catch (err) {
+            lastError = err;
+            if (isUnknownModelError(err)) {
+                continue;
+            }
+            throw err;
+        }
+    }
+
+    throw lastError instanceof Error
+        ? lastError
+        : new Error('GitHub Models request failed.');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI SERVICE
+// ─────────────────────────────────────────────────────────────────────────────
+
 export class AIService {
-    async generate(
-        req: GenerateRequest,
-        onChunk?: (chunk: string) => void
-    ): Promise<string> {
+    async generate(req: GenerateRequest, onChunk?: (chunk: string) => void): Promise<string> {
         const { provider, userPrompt, selectedModules } = req;
         const isUsingPlatformKey = !req.apiKey?.trim();
         const apiKey = resolveApiKey(provider, req.apiKey);
-        // If using platform Gemini key, restrict to curated free-tier-compatible models.
         const model = provider === 'gemini'
             ? safeGeminiModel(req.model, isUsingPlatformKey)
             : (req.model || DEFAULT_MODELS[provider]);
         const generationSeed = randomUUID().slice(0, 8);
         const systemPrompt = `You are an expert full-stack developer for the IDEA platform.`;
         const fullPrompt = buildFullstackPrompt(userPrompt, selectedModules, generationSeed, req.requirements);
-        const generationTemperature = 0.38;
+        const temperature = 0.38;
 
         switch (provider) {
-            case 'openai':
-                return generateWithOpenAI(apiKey, model, systemPrompt, fullPrompt, onChunk, generationTemperature);
-            case 'gemini':
-                return generateWithGeminiWithFallback(
-                    apiKey,
-                    model,
-                    systemPrompt,
-                    fullPrompt,
-                    onChunk,
-                    generationTemperature,
-                    isUsingPlatformKey
-                );
-            case 'anthropic':
-                return generateWithAnthropic(apiKey, model, systemPrompt, fullPrompt, onChunk, generationTemperature);
-            case 'ollama':
-                return generateWithOllama(model || DEFAULT_MODELS.ollama, systemPrompt, fullPrompt, onChunk, generationTemperature);
-            case 'nvidia':
-                return generateWithNvidia(apiKey, model || DEFAULT_MODELS.nvidia, systemPrompt, fullPrompt, onChunk, generationTemperature);
-            default:
-                throw new Error(`Unsupported AI provider: ${provider}`);
+            case 'openai': return generateWithOpenAI(apiKey, model, systemPrompt, fullPrompt, onChunk, temperature);
+            case 'gemini': return generateWithGeminiWithFallback(apiKey, model, systemPrompt, fullPrompt, onChunk, temperature, isUsingPlatformKey);
+            case 'anthropic': return generateWithAnthropic(apiKey, model, systemPrompt, fullPrompt, onChunk, temperature);
+            case 'ollama': return generateWithOllama(model || DEFAULT_MODELS.ollama, systemPrompt, fullPrompt, onChunk, temperature);
+            case 'nvidia': return generateWithNvidia(apiKey, model || DEFAULT_MODELS.nvidia, systemPrompt, fullPrompt, onChunk, temperature);
+            case 'github': return generateWithGitHubModels(apiKey, model || DEFAULT_MODELS.github, systemPrompt, fullPrompt, onChunk, temperature);
+            default: throw new Error(`Unsupported AI provider: ${provider}`);
         }
     }
 
-    /**
-     * Single non-streaming completion call used for requirements gathering.
-     * Returns a plain string (the model's full response).
-     * Uses the same API key resolution and model defaults as the streaming path.
-     */
+    // FIX: Unified non-streaming method — no copy-paste fallback logic per caller
     private async generateNonStreaming(params: NonStreamingParams): Promise<string> {
         const provider = params.provider as AIProvider;
         const isUsingPlatformKey = !params.apiKey?.trim();
         const resolvedKey = resolveApiKey(provider, params.apiKey);
         const resolvedModel = provider === 'gemini'
             ? safeGeminiModel(params.model, isUsingPlatformKey)
-            : (params.model || DEFAULT_MODELS[provider]);
+            : (normalizeModelForProvider(provider, params.model) || DEFAULT_MODELS[provider]);
+        const systemPrompt = `You are a helpful AI assistant. Return only valid JSON when asked.`;
+
+        // Gemini gets the full fallback chain; other providers call once with timeout
+        if (provider === 'gemini') {
+            return generateWithGeminiWithFallback(
+                resolvedKey, resolvedModel, systemPrompt, params.prompt,
+                undefined, params.temperature ?? 0.2, isUsingPlatformKey,
+            );
+        }
 
         switch (provider) {
-            case 'gemini':
-                if (isUsingPlatformKey) {
-                    const fallbackChain = getGeminiFallbackChain(resolvedModel, true);
-                    let lastError: unknown = null;
-
-                    for (const candidateModel of fallbackChain) {
-                        try {
-                            return await this.callGeminiNonStreaming(
-                                resolvedKey,
-                                candidateModel,
-                                params.prompt,
-                                params.maxTokens,
-                                params.temperature
-                            );
-                        } catch (err) {
-                            lastError = err;
-                            if (!isQuotaOrRateLimitError(err)) {
-                                throw err;
-                            }
-                            console.warn(`[requirements] Gemini model ${candidateModel} unavailable, trying fallback model.`);
-                        }
-                    }
-
-                    throw lastError || new Error('Gemini non-streaming request failed on all fallback models.');
-                }
-
-                return this.callGeminiNonStreaming(resolvedKey, resolvedModel, params.prompt, params.maxTokens, params.temperature);
             case 'openai':
-                return this.callOpenAiNonStreaming(resolvedKey, resolvedModel, params.prompt, params.maxTokens, params.temperature);
+                return this.callOpenAiNonStreaming(resolvedKey, resolvedModel, params.prompt, params.maxTokens, params.temperature, Boolean(params.forceJson));
             case 'anthropic':
-                return this.callAnthropicNonStreaming(resolvedKey, resolvedModel, params.prompt, params.maxTokens, params.temperature);
+                return generateWithAnthropic(resolvedKey, resolvedModel, systemPrompt, params.prompt, undefined, params.temperature ?? 0.2);
             case 'ollama':
-                return this.callOllamaNonStreaming(params.prompt, resolvedModel, params.maxTokens, params.temperature);
+                return generateWithOllama(resolvedModel, systemPrompt, params.prompt, undefined, params.temperature ?? 0.2);
             case 'nvidia':
-                return this.callNvidiaNonStreaming(resolvedKey, resolvedModel, params.prompt, params.maxTokens, params.temperature);
+                return generateWithNvidia(resolvedKey, resolvedModel, systemPrompt, params.prompt, undefined, params.temperature ?? 0.2);
+            case 'github':
+                return this.callGitHubModelsNonStreaming(resolvedKey, resolvedModel, params.prompt, params.maxTokens, params.temperature, Boolean(params.forceJson));
             default:
                 throw new Error(`Unknown provider: ${params.provider}`);
         }
@@ -728,11 +1076,7 @@ export class AIService {
         apiKey?: string;
         model?: string;
     }): Promise<QuestionsResponse> {
-
-        const prompt = buildRequirementsQuestionsPrompt(
-            params.userIdea,
-            params.selectedModules
-        );
+        const prompt = buildRequirementsQuestionsPrompt(params.userIdea, params.selectedModules);
 
         let rawResponse = '';
         try {
@@ -741,12 +1085,12 @@ export class AIService {
                 apiKey: params.apiKey,
                 model: params.model,
                 prompt,
-                maxTokens: 1200,
-                temperature: 0.3
+                maxTokens: 1400,
+                temperature: 0.2,
+                forceJson: true,
             });
         } catch (err) {
             if (isQuotaOrRateLimitError(err)) {
-                console.warn('[requirements] AI question generation failed due to provider quota/rate limit.');
                 track('requirements.question_gen.quota_exceeded', { provider: params.provider });
                 throw new Error('AI question generation is temporarily unavailable due to provider limits. Please retry or use your own API key.');
             }
@@ -755,110 +1099,53 @@ export class AIService {
 
         let parsed: QuestionsResponse;
         try {
-            parsed = normalizeQuestionsResponse(parseJsonLenient<QuestionsResponse>(rawResponse));
+            parsed = parseQuestionsResponseFromRaw(rawResponse);
         } catch {
             track('requirements.question_gen.parse_failed', { provider: params.provider });
             try {
                 const repairPrompt = buildJsonRepairPrompt(
                     rawResponse,
-                    '{ "appType": "string", "projectName": "string", "questions": [{ "id": "q1", "question": "string", "hint": "string", "category": "features|design|users|technical|scope", "required": true }] }'
+                    '{ "appType": "string", "projectName": "string", "questions": [{ "id": "q1", "question": "string", "hint": "string", "category": "features|design|users|technical|scope", "required": true }] }',
                 );
-
                 const repaired = await this.generateNonStreaming({
-                    provider: params.provider,
-                    apiKey: params.apiKey,
-                    model: params.model,
-                    prompt: repairPrompt,
-                    maxTokens: 650,
-                    temperature: 0
+                    provider: params.provider, apiKey: params.apiKey, model: params.model,
+                    prompt: repairPrompt, maxTokens: 1000, temperature: 0, forceJson: true,
                 });
-
-                parsed = normalizeQuestionsResponse(parseJsonLenient<QuestionsResponse>(repaired));
+                parsed = parseQuestionsResponseFromRaw(repaired);
                 track('requirements.question_gen.repaired', { provider: params.provider });
             } catch {
-                console.warn('[requirements] AI question generation failed after JSON parse and repair attempts. Falling back to deterministic questions.');
-                const slugBase = params.userIdea
-                    .toLowerCase()
-                    .replace(/[^a-z0-9\s-]/g, ' ')
-                    .trim()
-                    .replace(/\s+/g, '-')
-                    .replace(/-+/g, '-')
-                    .slice(0, 30)
-                    .replace(/^-|-$/g, '') || 'my-app';
-
+                const slugBase = params.userIdea.toLowerCase()
+                    .replace(/[^a-z0-9\s-]/g, ' ').trim().replace(/\s+/g, '-')
+                    .replace(/-+/g, '-').slice(0, 30).replace(/^-|-$/g, '') || 'my-app';
                 parsed = {
                     appType: 'other',
                     projectName: slugBase,
                     questions: [
-                        {
-                            id: 'qf1',
-                            question: 'What visual style fits your brand - minimal and clean, bold and vibrant, or professional and enterprise?',
-                            hint: 'e.g. minimal and clean, light theme',
-                            category: 'design',
-                            required: true
-                        },
-                        {
-                            id: 'qf2',
-                            question: 'Is this a personal project or a real business launch?',
-                            hint: 'e.g. real business, planning to launch publicly',
-                            category: 'scope',
-                            required: true
-                        },
-                        {
-                            id: 'qf3',
-                            question: 'Are there any specific technologies you want to use?',
-                            hint: 'e.g. Stripe for payments, PostgreSQL for database',
-                            category: 'technical',
-                            required: true
-                        }
-                    ]
+                        { id: 'qf1', question: 'What visual style fits your brand — minimal, bold, or enterprise?', hint: 'e.g. minimal and clean, light theme', category: 'design', required: true },
+                        { id: 'qf2', question: 'Is this a personal project or a real business launch?', hint: 'e.g. real business, planning to launch publicly', category: 'scope', required: true },
+                        { id: 'qf3', question: 'Do you need any third-party integrations like payments, file uploads, email, or social login?', hint: 'e.g. Stripe for payments, Cloudinary for uploads', category: 'technical', required: true },
+                    ],
                 };
             }
         }
 
-        // Validate minimum structure
         if (!Array.isArray(parsed.questions) || parsed.questions.length === 0) {
             throw new Error('AI returned no questions. Please try again.');
         }
 
-        if (parsed.questions.length < 3) {
-            const fallbacks = [
-                {
-                    id: 'qf1',
-                    question: 'What visual style fits your brand - minimal and clean, bold and vibrant, or professional and enterprise?',
-                    hint: 'e.g. minimal and clean, light theme',
-                    category: 'design' as const,
-                    required: false
-                },
-                {
-                    id: 'qf2',
-                    question: 'Is this a personal project or a real business launch?',
-                    hint: 'e.g. real business, planning to launch publicly',
-                    category: 'scope' as const,
-                    required: false
-                },
-                {
-                    id: 'qf3',
-                    question: 'Are there any specific technologies you want to use?',
-                    hint: 'e.g. Stripe for payments, PostgreSQL for database',
-                    category: 'technical' as const,
-                    required: false
-                }
-            ];
+        const fallbacks = [
+            { id: 'qf1', question: 'What visual style fits your brand?', hint: 'e.g. minimal and clean', category: 'design' as const, required: false },
+            { id: 'qf2', question: 'Is this a personal project or a real business launch?', hint: 'e.g. business launch', category: 'scope' as const, required: false },
+            { id: 'qf3', question: 'Any specific tech or third-party integrations needed?', hint: 'e.g. Stripe, Google Maps', category: 'technical' as const, required: false },
+        ];
 
-            while (parsed.questions.length < 3) {
-                const fallbackIndex = parsed.questions.length;
-                const fb = fallbacks[fallbackIndex];
-                if (!fb) break;
-                parsed.questions.push(fb);
-            }
+        while (parsed.questions.length < 3) {
+            const fb = fallbacks[parsed.questions.length];
+            if (!fb) break;
+            parsed.questions.push(fb);
         }
 
-        track('requirements.question_gen.success', {
-            provider: params.provider,
-            ideaLength: params.userIdea.length
-        });
-
+        track('requirements.question_gen.success', { provider: params.provider, ideaLength: params.userIdea.length });
         return parsed;
     }
 
@@ -871,249 +1158,198 @@ export class AIService {
         apiKey?: string;
         model?: string;
     }): Promise<RequirementsDocument> {
-
-        const prompt = buildRequirementsCompilePrompt(
-            params.originalPrompt,
-            params.projectName,
-            params.answers,
-            params.selectedModules
-        );
-
-        const fallbackRequirements = buildFallbackRequirementsDocument({
-            originalPrompt: params.originalPrompt,
-            projectName: params.projectName,
-            answers: params.answers,
-            selectedModules: params.selectedModules
-        });
+        const prompt = buildRequirementsCompilePrompt(params.originalPrompt, params.projectName, params.answers, params.selectedModules);
+        const fallback = buildFallbackRequirementsDocument(params);
 
         let rawResponse = '';
         let source: 'ai' | 'fallback' = 'ai';
+
         try {
             rawResponse = await this.generateNonStreaming({
-                provider: params.provider,
-                apiKey: params.apiKey,
-                model: params.model,
-                prompt,
-                maxTokens: 800,
-                temperature: 0.3
+                provider: params.provider, apiKey: params.apiKey, model: params.model,
+                prompt, maxTokens: 1600, temperature: 0.2, forceJson: true,
             });
         } catch (err) {
-            // Free-tier quota/rate limits should not break the UX flow.
-            // Return deterministic requirements document instead of bubbling a 500.
             if (isQuotaOrRateLimitError(err)) {
                 source = 'fallback';
                 track('requirements.compile.success', { provider: params.provider, source });
-                return {
-                    ...fallbackRequirements,
-                    _meta: {
-                        source,
-                        provider: params.provider || 'gemini',
-                        model: params.model || 'default',
-                        timestamp: new Date().toISOString()
-                    }
-                };
+                return { ...fallback, _meta: { source, provider: params.provider || 'gemini', model: params.model || 'default', timestamp: new Date().toISOString() } };
             }
             throw err;
         }
 
         let parsed: RequirementsDocument;
         try {
-            parsed = normalizeRequirementsDocument(parseJsonLenient<RequirementsDocument>(rawResponse));
+            parsed = parseRequirementsDocumentFromRaw(rawResponse);
         } catch {
             track('requirements.compile.parse_failed', { provider: params.provider });
             try {
-                const repairPrompt = buildJsonRepairPrompt(
-                    rawResponse,
-                    '{ "originalPrompt": "string", "projectName": "string", "appType": "string", "targetUsers": "string", "coreFeatures": ["string"], "designPreference": "string", "themeMode": "light|dark|hybrid|any", "scale": "personal|startup|enterprise", "techPreferences": "string", "additionalNotes": "string", "answers": [{"questionId":"string","question":"string","answer":"string"}], "compiledSummary": "string" }'
-                );
-
-                const repaired = await this.generateNonStreaming({
-                    provider: params.provider,
-                    apiKey: params.apiKey,
-                    model: params.model,
-                    prompt: repairPrompt,
-                    maxTokens: 950,
-                    temperature: 0
+                const strictRetry = await this.generateNonStreaming({
+                    provider: params.provider, apiKey: params.apiKey, model: params.model,
+                    prompt: `${prompt}\n\nCRITICAL: Return ONLY a valid JSON object with no markdown/code fences/comments.`,
+                    maxTokens: 1800, temperature: 0, forceJson: true,
                 });
-
-                parsed = normalizeRequirementsDocument(parseJsonLenient<RequirementsDocument>(repaired));
+                parsed = parseRequirementsDocumentFromRaw(strictRetry);
                 track('requirements.compile.repaired', { provider: params.provider });
             } catch {
-                parsed = fallbackRequirements;
-                source = 'fallback';
+                try {
+                    const repairPrompt = buildJsonRepairPrompt(rawResponse,
+                        '{ "originalPrompt": "string", "projectName": "string", "appType": "string", "targetUsers": "string", "coreFeatures": ["string"], "designPreference": "string", "themeMode": "light|dark|hybrid|any", "scale": "personal|startup|enterprise", "techPreferences": "string", "additionalNotes": "string", "answers": [], "compiledSummary": "string" }',
+                    );
+                    const repaired = await this.generateNonStreaming({
+                        provider: params.provider, apiKey: params.apiKey, model: params.model,
+                        prompt: repairPrompt, maxTokens: 1400, temperature: 0, forceJson: true,
+                    });
+                    parsed = parseRequirementsDocumentFromRaw(repaired);
+                } catch {
+                    parsed = fallback;
+                    source = 'fallback';
+                }
             }
+            if (!parsed || !parsed.compiledSummary) { parsed = fallback; source = 'fallback'; }
         }
 
-        // Fill incomplete model output with deterministic fallback values.
-        if (!parsed.compiledSummary.trim()) parsed.compiledSummary = fallbackRequirements.compiledSummary;
-        if (!Array.isArray(parsed.coreFeatures) || parsed.coreFeatures.length === 0) {
-            parsed.coreFeatures = fallbackRequirements.coreFeatures;
-        }
-        if (!parsed.projectName) parsed.projectName = fallbackRequirements.projectName;
+        if (!parsed.compiledSummary.trim()) parsed.compiledSummary = fallback.compiledSummary;
+        if (!Array.isArray(parsed.coreFeatures) || parsed.coreFeatures.length === 0) parsed.coreFeatures = fallback.coreFeatures;
+        if (!parsed.projectName) parsed.projectName = fallback.projectName;
         if (!parsed.originalPrompt) parsed.originalPrompt = params.originalPrompt;
-        // Always preserve the exact user-submitted interview answers.
-        // Model output may omit or rewrite answers during JSON repair.
         parsed.answers = params.answers;
+
+        parsed = rebalanceRequirementsForDomain(parsed, {
+            originalPrompt: params.originalPrompt,
+            selectedModules: params.selectedModules,
+        });
 
         track('requirements.compile.success', { provider: params.provider, source });
         return {
             ...parsed,
-            _meta: {
-                source,
-                provider: params.provider || 'gemini',
-                model: params.model || 'default',
-                timestamp: new Date().toISOString()
-            }
+            _meta: { source, provider: params.provider || 'gemini', model: params.model || 'default', timestamp: new Date().toISOString() },
         };
     }
 
-    private async callGeminiNonStreaming(
-        apiKey: string,
-        model: string,
-        prompt: string,
-        maxTokens: number,
-        temperature: number
-    ): Promise<string> {
-        const genAI = new GoogleGenerativeAI(apiKey);
-        const geminiModel = genAI.getGenerativeModel({
-            model,
-            generationConfig: { maxOutputTokens: maxTokens, temperature }
-        });
-        const result = await geminiModel.generateContent(prompt);
-        return result.response.text();
-    }
-
     private async callOpenAiNonStreaming(
-        apiKey: string,
-        model: string,
-        prompt: string,
-        maxTokens: number,
-        temperature: number
+        apiKey: string, model: string, prompt: string,
+        maxTokens: number, temperature: number, forceJson = false,
     ): Promise<string> {
         const client = new OpenAI({ apiKey });
-        const response = await client.chat.completions.create({
-            model,
-            messages: [{ role: 'user', content: prompt }],
-            max_tokens: maxTokens,
-            temperature
-        });
-        return response.choices[0]?.message?.content || '';
+        const modelName = normalizeModelForProvider('openai', model) || DEFAULT_MODELS.openai;
+        const base = { model: modelName, messages: [{ role: 'user' as const, content: prompt }], max_tokens: maxTokens, temperature };
+
+        return withTimeout(
+            (async () => {
+                if (forceJson) {
+                    try {
+                        const r = await client.chat.completions.create({ ...base, response_format: { type: 'json_object' } } as any);
+                        return r.choices[0]?.message?.content || '';
+                    } catch {}
+                }
+                const r = await client.chat.completions.create(base as any);
+                return r.choices[0]?.message?.content || '';
+            })(),
+            DEFAULT_NONSTREAMING_TIMEOUT_MS,
+            `OpenAI-NS/${modelName}`,
+        );
     }
 
-    private async callAnthropicNonStreaming(
-        apiKey: string,
-        model: string,
-        prompt: string,
-        maxTokens: number,
-        temperature: number
+    private async callGitHubModelsNonStreaming(
+        apiKey: string, model: string, prompt: string,
+        maxTokens: number, temperature: number, forceJson = false,
     ): Promise<string> {
-        const client = new Anthropic({ apiKey });
-        const message = await client.messages.create({
-            model,
-            max_tokens: maxTokens,
-            temperature,
-            messages: [{ role: 'user', content: prompt }]
-        });
-        const block = message.content[0];
-        return block.type === 'text' ? block.text : '';
+        const client = createGitHubModelsClient(apiKey);
+        const modelsToTry = getGitHubModelFallbackChain(model);
+        let lastError: unknown = null;
+
+        for (const modelName of modelsToTry) {
+            const base = { model: modelName, messages: [{ role: 'user' as const, content: prompt }], max_tokens: maxTokens, temperature };
+            try {
+                return await withTimeout(
+                    (async () => {
+                        if (forceJson) {
+                            try {
+                                const r = await client.chat.completions.create({ ...base, response_format: { type: 'json_object' } } as any);
+                                return r.choices[0]?.message?.content || '';
+                            } catch {}
+                        }
+                        const r = await client.chat.completions.create(base as any);
+                        return r.choices[0]?.message?.content || '';
+                    })(),
+                    DEFAULT_NONSTREAMING_TIMEOUT_MS,
+                    `GitHub-NS/${modelName}`,
+                );
+            } catch (err) {
+                lastError = err;
+                if (isUnknownModelError(err)) {
+                    continue;
+                }
+                throw err;
+            }
+        }
+
+        throw lastError instanceof Error
+            ? lastError
+            : new Error('GitHub Models non-streaming request failed.');
     }
 
-    private async callOllamaNonStreaming(
-        prompt: string,
-        model: string,
-        maxTokens: number,
-        temperature: number
-    ): Promise<string> {
-        const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
-        const response = await fetch(`${ollamaUrl}/api/generate`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                model,
-                prompt,
-                stream: false,
-                options: { num_predict: maxTokens, temperature }
-            })
-        });
-        if (!response.ok) throw new Error(`Ollama error: ${response.statusText}`);
-        const data = await response.json() as { response: string };
-        return data.response;
-    }
-
-    private async callNvidiaNonStreaming(
-        apiKey: string,
-        model: string,
-        prompt: string,
-        maxTokens: number,
-        temperature: number
-    ): Promise<string> {
-        const client = new OpenAI({ apiKey, baseURL: NVIDIA_BASE_URL });
-        const response = await client.chat.completions.create({
-            model,
-            messages: [{ role: 'user', content: prompt }],
-            max_tokens: maxTokens,
-            temperature,
-            top_p: 0.7
-        });
-        return response.choices[0]?.message?.content || '';
-    }
-
-    async designToCode(
-        req: DesignToCodeRequest,
-        onChunk?: (chunk: string) => void
-    ): Promise<string> {
+    async designToCode(req: DesignToCodeRequest, onChunk?: (chunk: string) => void): Promise<string> {
         const { provider, designJSON, designDescription } = req;
         const isUsingPlatformKey = !req.apiKey?.trim();
         const apiKey = resolveApiKey(provider, req.apiKey);
-        const model = provider === 'gemini'
-            ? safeGeminiModel(req.model, isUsingPlatformKey)
-            : (req.model || DEFAULT_MODELS[provider]);
+        const model = provider === 'gemini' ? safeGeminiModel(req.model, isUsingPlatformKey) : (req.model || DEFAULT_MODELS[provider]);
         const systemPrompt = `You are an expert React + Tailwind developer.`;
         const prompt = buildDesignToCodePrompt(designJSON, designDescription);
 
         switch (provider) {
-            case 'openai':
-                return generateWithOpenAI(apiKey, model || DEFAULT_MODELS.openai, systemPrompt, prompt, onChunk);
-            case 'gemini':
-                return generateWithGemini(apiKey, model || DEFAULT_MODELS.gemini, systemPrompt, prompt, onChunk);
-            case 'anthropic':
-                return generateWithAnthropic(apiKey, model || DEFAULT_MODELS.anthropic, systemPrompt, prompt, onChunk);
-            case 'ollama':
-                return generateWithOllama(model || DEFAULT_MODELS.ollama, systemPrompt, prompt, onChunk);
-            case 'nvidia':
-                return generateWithNvidia(apiKey, model || DEFAULT_MODELS.nvidia, systemPrompt, prompt, onChunk);
-            default:
-                throw new Error(`Unsupported AI provider: ${provider}`);
+            case 'openai': return generateWithOpenAI(apiKey, model || DEFAULT_MODELS.openai, systemPrompt, prompt, onChunk);
+            case 'gemini': return generateWithGeminiWithFallback(apiKey, model || DEFAULT_MODELS.gemini, systemPrompt, prompt, onChunk, 0.3, isUsingPlatformKey);
+            case 'anthropic': return generateWithAnthropic(apiKey, model || DEFAULT_MODELS.anthropic, systemPrompt, prompt, onChunk);
+            case 'ollama': return generateWithOllama(model || DEFAULT_MODELS.ollama, systemPrompt, prompt, onChunk);
+            case 'nvidia': return generateWithNvidia(apiKey, model || DEFAULT_MODELS.nvidia, systemPrompt, prompt, onChunk);
+            case 'github': return generateWithGitHubModels(apiKey, model || DEFAULT_MODELS.github, systemPrompt, prompt, onChunk);
+            default: throw new Error(`Unsupported AI provider: ${provider}`);
         }
     }
 
-    async refine(
-        req: RefineRequest,
-        onChunk?: (chunk: string) => void
-    ): Promise<string> {
+    async refine(req: RefineRequest, onChunk?: (chunk: string) => void): Promise<string> {
         const { provider, previousCode, refinementRequest } = req;
+        const isUsingPlatformKey = !req.apiKey?.trim();
+        const apiKey = resolveApiKey(provider, req.apiKey);
+        const model = provider === 'gemini' ? safeGeminiModel(req.model, isUsingPlatformKey) : (req.model || DEFAULT_MODELS[provider]);
+        const systemPrompt = `You are an expert full-stack developer refining previously generated code.`;
+        const compressedPreviousCode = compressRefineContextFiles(previousCode, refinementRequest);
+        const prompt = buildRefinePrompt(compressedPreviousCode, refinementRequest);
+
+        switch (provider) {
+            case 'openai': return generateWithOpenAI(apiKey, model || DEFAULT_MODELS.openai, systemPrompt, prompt, onChunk);
+            case 'gemini': return generateWithGeminiWithFallback(apiKey, model || DEFAULT_MODELS.gemini, systemPrompt, prompt, onChunk, 0.3, isUsingPlatformKey);
+            case 'anthropic': return generateWithAnthropic(apiKey, model || DEFAULT_MODELS.anthropic, systemPrompt, prompt, onChunk);
+            case 'ollama': return generateWithOllama(model || DEFAULT_MODELS.ollama, systemPrompt, prompt, onChunk);
+            case 'nvidia': return generateWithNvidia(apiKey, model || DEFAULT_MODELS.nvidia, systemPrompt, prompt, onChunk);
+            case 'github': return generateWithGitHubModels(apiKey, model || DEFAULT_MODELS.github, systemPrompt, prompt, onChunk);
+            default: throw new Error(`Unsupported AI provider: ${provider}`);
+        }
+    }
+
+    async chatAboutProject(req: ProjectChatRequest): Promise<string> {
+        const provider = req.provider as AIProvider;
         const isUsingPlatformKey = !req.apiKey?.trim();
         const apiKey = resolveApiKey(provider, req.apiKey);
         const model = provider === 'gemini'
             ? safeGeminiModel(req.model, isUsingPlatformKey)
             : (req.model || DEFAULT_MODELS[provider]);
-        const systemPrompt = `You are an expert full-stack developer refining previously generated code.`;
-        const prompt = buildRefinePrompt(previousCode, refinementRequest);
 
-        switch (provider) {
-            case 'openai':
-                return generateWithOpenAI(apiKey, model || DEFAULT_MODELS.openai, systemPrompt, prompt, onChunk);
-            case 'gemini':
-                return generateWithGemini(apiKey, model || DEFAULT_MODELS.gemini, systemPrompt, prompt, onChunk);
-            case 'anthropic':
-                return generateWithAnthropic(apiKey, model || DEFAULT_MODELS.anthropic, systemPrompt, prompt, onChunk);
-            case 'ollama':
-                return generateWithOllama(model || DEFAULT_MODELS.ollama, systemPrompt, prompt, onChunk);
-            case 'nvidia':
-                return generateWithNvidia(apiKey, model || DEFAULT_MODELS.nvidia, systemPrompt, prompt, onChunk);
-            default:
-                throw new Error(`Unsupported AI provider: ${provider}`);
-        }
+        const ctx = req.projectContext || {};
+        const prompt = [
+            'You are a senior full-stack engineering assistant helping the user understand and improve their generated project.',
+            'Reply in concise plain English. If user asks for a code change, explain what should change and where.',
+            `Project name: ${ctx.projectName || 'Untitled Project'}`,
+            `Description: ${ctx.description || ''}`,
+            `File count: ${ctx.fileCount || 0}`,
+            `Modules: ${(ctx.modules || []).slice(0, 20).join(', ') || 'unknown'}`,
+            `Key files: ${(ctx.keyFiles || []).slice(0, 30).join(', ') || 'none'}`,
+            `User message: ${req.message}`,
+        ].join('\n');
+
+        return this.generateNonStreaming({ provider, apiKey, model, prompt, maxTokens: 700, temperature: 0.35 });
     }
 }
 

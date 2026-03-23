@@ -39,6 +39,23 @@ interface UseRequirementsFlowReturn {
   skipToConfirm: () => void;
 }
 
+function normalizeModelForRequest(provider: string, model?: string): string | undefined {
+  const p = String(provider || '').trim().toLowerCase();
+  const m = String(model || '').trim();
+  if (!m) return undefined;
+
+  if (p === 'openai') {
+    return m.replace(/^openai\//i, '');
+  }
+
+  if (p === 'github') {
+    if (/^[a-z0-9-]+\/[a-z0-9-._]+$/i.test(m)) return m;
+    if (/^gpt-/i.test(m)) return `openai/${m}`;
+  }
+
+  return m;
+}
+
 function sanitizeProjectSlug(rawName: string, fallbackIdea = ''): string {
   const source = String(rawName || '').trim() || String(fallbackIdea || '').trim();
   if (!source) return 'untitled-project';
@@ -117,7 +134,7 @@ export function useRequirementsFlow(
         selectedModules: params.selectedModules,
         provider: params.provider,
         apiKey: params.apiKey || undefined,
-        model: params.model || undefined
+        model: normalizeModelForRequest(params.provider, params.model)
       });
 
       const result = data.data as QuestionsApiResponse;
@@ -177,7 +194,7 @@ export function useRequirementsFlow(
         selectedModules: params.selectedModules,
         provider: params.provider,
         apiKey: params.apiKey || undefined,
-        model: params.model || undefined
+        model: normalizeModelForRequest(params.provider, params.model)
       });
 
       setRequirements(data.data.requirements as RequirementsDocument);
@@ -213,7 +230,7 @@ export function useRequirementsFlow(
       targetUsers: 'general users',
       coreFeatures: [],
       designPreference: 'professional and modern',
-      themeMode: 'any',
+      themeMode: 'light',
       scale: 'personal',
       techPreferences: '',
       additionalNotes: '',

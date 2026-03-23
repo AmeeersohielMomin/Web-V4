@@ -4,7 +4,7 @@ import { randomBytes } from 'crypto';
 import { PlatformUser } from './platform-user.model';
 
 export class PlatformAuthService {
-  async register(email: string, password: string, name?: string) {
+  async register(email: string, password: string, name?: string, inviteToken?: string) {
     const existing = await PlatformUser.findOne({ email: email.toLowerCase() });
     if (existing) {
       throw new Error('An account with this email already exists');
@@ -16,6 +16,11 @@ export class PlatformAuthService {
       passwordHash,
       name: name || ''
     });
+
+    if (inviteToken) {
+      const { teamService } = await import('../teams/team.service');
+      await teamService.acceptInvite(user._id.toString(), inviteToken);
+    }
 
     const token = this.signToken(user._id.toString(), user.email);
     return {

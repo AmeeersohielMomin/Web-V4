@@ -1,6 +1,41 @@
 import { randomBytes } from 'crypto';
 import { Team } from './team.model';
 import { PlatformUser } from '../platform-auth/platform-user.model';
+import { sendTeamInviteEmail } from '../../utils/mailer';
+
+function normalizeInviteTokenInput(rawValue: string): string {
+  let value = String(rawValue || '').trim().replace(/^['\"]|['\"]$/g, '');
+  if (!value) return '';
+
+  try {
+    value = decodeURIComponent(value);
+  } catch {
+    // Keep original value if decode fails.
+  }
+
+  const extractFromParams = (input: string) => {
+    const query = input.startsWith('?') ? input.slice(1) : input;
+    const params = new URLSearchParams(query);
+    return String(params.get('token') || params.get('inviteToken') || '').trim();
+  };
+
+  if (value.includes('://')) {
+    try {
+      const parsed = new URL(value);
+      const extracted = String(parsed.searchParams.get('token') || parsed.searchParams.get('inviteToken') || '').trim();
+      if (extracted) value = extracted;
+    } catch {
+      // Fall back to direct parsing.
+    }
+  }
+
+  if (value.startsWith('?') || value.includes('token=') || value.includes('inviteToken=')) {
+    const extracted = extractFromParams(value);
+    if (extracted) value = extracted;
+  }
+
+  return value.trim().replace(/[)\].,;]+$/g, '');
+}
 
 export class TeamService {
   async createTeam(ownerId: string, name: string) {
@@ -54,35 +89,91 @@ export class TeamService {
       }
     });
 
-    const inviteUrl = `${process.env.FRONTEND_URL?.split(',')[0]?.trim() || 'http://localhost:3000'}/team/join?token=${token}`;
+    const frontendBase = process.env.FRONTEND_URL?.split(',')[0]?.trim() || 'http://localhost:3000';
+    const inviteUrl = `${frontendBase}/team?token=${token}`;
+    const signupInviteUrl = `${frontendBase}/signup?inviteToken=${token}&email=${encodeURIComponent(email.toLowerCase())}`;
     console.log(`[Team Invite] ${email}: ${inviteUrl}`);
 
-    return { email, role, token: process.env.NODE_ENV !== 'production' ? token : undefined };
+    let emailSent = false;
+    let emailError: string | undefined;
+    try {
+      const mailResult = await sendTeamInviteEmail({
+        to: email.toLowerCase(),
+        teamName: team.name,
+        role,
+        inviteUrl,
+        signupInviteUrl
+      });
+      emailSent = mailResult.sent;
+      emailError = mailResult.reason;
+    } catch (err: any) {
+      emailError = err?.message || 'Failed to send invite email';
+      console.error('[Team Invite Email] Error:', emailError);
+    }
+
+    return {
+      email,
+      role,
+      inviteUrl,
+      signupInviteUrl,
+      emailSent,
+      emailError,
+      expiresAt,
+      token: process.env.NODE_ENV !== 'production' ? token : undefined
+    };
   }
 
   async acceptInvite(userId: string, token: string) {
-    const team = await Team.findOne({
-      'invites.token': token,
-      'invites.expiresAt': { $gt: new Date() }
-    });
-
-    if (!team) throw new Error('Invalid or expired invite');
-
-    const invite = team.invites.find((i: any) => i.token === token);
-    if (!invite) throw new Error('Invite not found');
+    const normalizedToken = normalizeInviteTokenInput(token);
+    if (!normalizedToken) throw new Error('Invite token is required');
 
     const user = await PlatformUser.findById(userId);
     if (!user) throw new Error('User not found');
+
+    const team = await Team.findOne({
+      'invites.token': normalizedToken,
+      'invites.expiresAt': { $gt: new Date() }
+    });
+
+    // If token is already consumed/expired but user is already in a team,
+    // treat this as idempotent success to avoid noisy 400s on repeated clicks.
+    if (!team) {
+      if (user.teamId) {
+        return {
+          teamId: user.teamId,
+          role: user.teamRole || 'viewer',
+          alreadyMember: true
+        };
+      }
+      throw new Error('Invalid or expired invite');
+    }
+
+    const invite = team.invites.find((i: any) => i.token === normalizedToken);
+    if (!invite) throw new Error('Invite not found');
 
     if (user.email.toLowerCase() !== invite.email.toLowerCase()) {
       throw new Error('This invite is for a different email address');
     }
 
-    if (user.teamId) throw new Error('You are already in a team');
+    if (user.teamId) {
+      if (String(user.teamId) === String(team._id)) {
+        await Team.findByIdAndUpdate(team._id, {
+          $pull: { invites: { token: normalizedToken } }
+        });
+
+        return {
+          teamId: team._id,
+          role: user.teamRole || invite.role,
+          alreadyMember: true
+        };
+      }
+
+      throw new Error('You are already in another team. Leave current team first.');
+    }
 
     await Team.findByIdAndUpdate(team._id, {
       $push: { members: { userId, role: invite.role } },
-      $pull: { invites: { token } }
+      $pull: { invites: { token: normalizedToken } }
     });
 
     await PlatformUser.findByIdAndUpdate(userId, {
@@ -109,6 +200,31 @@ export class TeamService {
     });
 
     return { removed: true };
+  }
+
+  async updateMemberRole(
+    teamId: string,
+    ownerUserId: string,
+    targetUserId: string,
+    role: 'editor' | 'viewer'
+  ) {
+    const team = await Team.findById(teamId);
+    if (!team) throw new Error('Team not found');
+    if (team.ownerId.toString() !== ownerUserId) throw new Error('Only the owner can change member roles');
+    if (ownerUserId === targetUserId) throw new Error('Owner role cannot be changed');
+
+    const target = team.members.find((m: any) => m.userId.toString() === targetUserId);
+    if (!target) throw new Error('Member not found');
+    if (target.role === 'owner') throw new Error('Owner role cannot be changed');
+
+    await Team.updateOne(
+      { _id: teamId, 'members.userId': targetUserId },
+      { $set: { 'members.$.role': role } }
+    );
+
+    await PlatformUser.findByIdAndUpdate(targetUserId, { teamRole: role });
+
+    return { userId: targetUserId, role };
   }
 
   async leaveTeam(userId: string) {

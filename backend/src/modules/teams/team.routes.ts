@@ -36,7 +36,19 @@ router.post('/invite', requireAuth, async (req: Request, res: Response) => {
     const user = await PlatformUser.findById((req as any).userId).select('teamId');
     if (!user?.teamId) return res.status(400).json({ success: false, data: null, error: 'You are not in a team' });
     const { email, role } = req.body;
-    const result = await teamService.inviteMember(user.teamId.toString(), (req as any).userId, email, role);
+    const normalizedEmail = String(email || '').trim().toLowerCase();
+    const normalizedRole = role === 'viewer' ? 'viewer' : 'editor';
+
+    if (!normalizedEmail || !/^\S+@\S+\.\S+$/.test(normalizedEmail)) {
+      return res.status(400).json({ success: false, data: null, error: 'Valid invite email is required' });
+    }
+
+    const result = await teamService.inviteMember(
+      user.teamId.toString(),
+      (req as any).userId,
+      normalizedEmail,
+      normalizedRole
+    );
     res.json({ success: true, data: result, error: null });
   } catch (err: any) {
     res.status(400).json({ success: false, data: null, error: err.message });
@@ -46,7 +58,11 @@ router.post('/invite', requireAuth, async (req: Request, res: Response) => {
 // Accept invite
 router.post('/accept-invite', requireAuth, async (req: Request, res: Response) => {
   try {
-    const { token } = req.body;
+    const token = String(req.body?.token || '').trim();
+    if (!token) {
+      return res.status(400).json({ success: false, data: null, error: 'Invite token is required' });
+    }
+
     const result = await teamService.acceptInvite((req as any).userId, token);
     res.json({ success: true, data: result, error: null });
   } catch (err: any) {
@@ -60,6 +76,29 @@ router.delete('/members/:targetUserId', requireAuth, async (req: Request, res: R
     const user = await PlatformUser.findById((req as any).userId).select('teamId');
     if (!user?.teamId) return res.status(400).json({ success: false, data: null, error: 'You are not in a team' });
     const result = await teamService.removeMember(user.teamId.toString(), (req as any).userId, req.params.targetUserId);
+    res.json({ success: true, data: result, error: null });
+  } catch (err: any) {
+    res.status(400).json({ success: false, data: null, error: err.message });
+  }
+});
+
+// Update member role (owner only)
+router.patch('/members/:targetUserId/role', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const user = await PlatformUser.findById((req as any).userId).select('teamId');
+    if (!user?.teamId) return res.status(400).json({ success: false, data: null, error: 'You are not in a team' });
+
+    const role = req.body?.role === 'viewer' ? 'viewer' : req.body?.role === 'editor' ? 'editor' : null;
+    if (!role) {
+      return res.status(400).json({ success: false, data: null, error: 'Role must be editor or viewer' });
+    }
+
+    const result = await teamService.updateMemberRole(
+      user.teamId.toString(),
+      (req as any).userId,
+      req.params.targetUserId,
+      role
+    );
     res.json({ success: true, data: result, error: null });
   } catch (err: any) {
     res.status(400).json({ success: false, data: null, error: err.message });

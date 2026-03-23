@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 
 const apiKeySchema = new mongoose.Schema(
   {
-    provider: { type: String, enum: ['openai', 'gemini', 'anthropic', 'ollama'], required: true },
+    provider: { type: String, enum: ['openai', 'github', 'gemini', 'anthropic', 'ollama'], required: true },
     key: { type: String, required: true }
   },
   { _id: false }

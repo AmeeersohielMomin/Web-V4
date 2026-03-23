@@ -39,7 +39,8 @@ interface AuthContextValue {
     name: string,
     email: string,
     password: string,
-    confirmPassword?: string
+    confirmPassword?: string,
+    inviteToken?: string
   ) => Promise<void>;
   logout: () => void;
   refreshUser: () => Promise<void>;
@@ -147,13 +148,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       name: string,
       email: string,
       password: string,
-      confirmPassword?: string
+      confirmPassword?: string,
+      inviteToken?: string
     ) => {
       const response = await api.post('/api/platform/auth/register', {
         name,
         email,
         password,
-        confirmPassword: confirmPassword ?? password
+        confirmPassword: confirmPassword ?? password,
+        inviteToken: inviteToken || undefined
       });
       const token = response.data?.data?.token;
       const rawUser = response.data?.data?.user;

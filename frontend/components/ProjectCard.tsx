@@ -12,6 +12,13 @@ export interface DashboardProject {
   vercelDeployUrl?: string;
   githubRepoUrl?: string;
   railwayServiceUrl?: string;
+  accessRole?: 'owner' | 'editor' | 'viewer';
+  isOwner?: boolean;
+  canWrite?: boolean;
+  canDelete?: boolean;
+  canPublish?: boolean;
+  canDeploy?: boolean;
+  isTeamProject?: boolean;
 }
 
 interface ProjectCardProps {
@@ -39,6 +46,16 @@ export default function ProjectCard({
         <div>
           <div className="flex items-center gap-2">
             <h3 className="text-lg font-semibold text-slate-900">{project.name}</h3>
+            {project.isTeamProject && (
+              <span className="rounded-full bg-violet-50 px-2 py-0.5 text-[10px] font-medium text-violet-700 border border-violet-200">
+                Team
+              </span>
+            )}
+            {project.accessRole && (
+              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-700 border border-slate-200 capitalize">
+                {project.accessRole}
+              </span>
+            )}
             {project.isPublic && (
               <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700 border border-emerald-200">
                 📢 Public
@@ -115,7 +132,7 @@ export default function ProjectCard({
           onClick={() => onOpen(project)}
           className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-100"
         >
-          Open
+          {project.canWrite === false ? 'View' : 'Open'}
         </button>
         <button
           onClick={() => onDownload(project)}
@@ -124,7 +141,7 @@ export default function ProjectCard({
         >
           Download
         </button>
-        {onPublish && (
+        {onPublish && project.canPublish !== false && (
           <button
             onClick={() => onPublish(project)}
             className={`rounded-lg px-3 py-2 text-sm font-medium transition ${
@@ -140,7 +157,7 @@ export default function ProjectCard({
         <button
           onClick={() => onDelete(project)}
           className="rounded-lg border border-rose-300 px-3 py-2 text-sm font-medium text-rose-700 transition hover:bg-rose-50"
-          disabled={actionLoading}
+          disabled={actionLoading || project.canDelete === false}
         >
           Delete
         </button>

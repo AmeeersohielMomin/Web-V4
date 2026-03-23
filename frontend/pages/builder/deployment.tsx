@@ -12,6 +12,9 @@ type DeployStatus = 'idle' | 'building' | 'ready' | 'error';
 type BuilderProject = {
   projectId?: string | null;
   projectName?: string;
+  userId?: string;
+  accessRole?: 'owner' | 'editor' | 'viewer';
+  canDeploy?: boolean;
   modules?: string[];
   template?: string;
   backend?: string;
@@ -49,6 +52,7 @@ export default function DeploymentPage() {
 
   const [project, setProject] = useState<BuilderProject | null>(null);
   const [projectId, setProjectId] = useState<string | null>(null);
+  const [canDeployProject, setCanDeployProject] = useState(true);
 
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState('');
@@ -74,9 +78,6 @@ export default function DeploymentPage() {
 
   const vercelPollRef = useRef<number | null>(null);
   const railwayPollRef = useRef<number | null>(null);
-
-  const isFreePlan = (user?.plan || 'free') === 'free';
-  const isProPlan = (user?.plan || 'free') === 'pro' || (user?.plan || 'free') === 'team';
 
   useEffect(() => {
     const savedToken = sessionStorage.getItem('deploy_github_token') || '';
@@ -111,6 +112,28 @@ export default function DeploymentPage() {
         .replace(/-+$/, '')
     );
   }, [router]);
+
+  useEffect(() => {
+    const hydrateProjectPermissions = async () => {
+      if (!projectId) return;
+      try {
+        const res = await api.get(`/api/platform/projects/${projectId}`);
+        const projectData = res.data?.data?.project || {};
+        const canDeploy = typeof projectData.canDeploy === 'boolean' ? projectData.canDeploy : true;
+        setCanDeployProject(canDeploy);
+        setProject((prev) => ({
+          ...(prev || {}),
+          userId: projectData.userId ? String(projectData.userId) : prev?.userId,
+          accessRole: projectData.accessRole || prev?.accessRole,
+          canDeploy
+        }));
+      } catch {
+        setCanDeployProject(true);
+      }
+    };
+
+    void hydrateProjectPermissions();
+  }, [projectId]);
 
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
@@ -273,8 +296,8 @@ export default function DeploymentPage() {
   };
 
   const handleVercelDeploy = async () => {
-    if (isFreePlan) {
-      setError('Upgrade to Starter to deploy to Vercel');
+    if (!canDeployProject) {
+      setError('You are in viewer mode for this project and cannot deploy.');
       return;
     }
 
@@ -317,8 +340,8 @@ export default function DeploymentPage() {
   };
 
   const handlePushGithub = async () => {
-    if (isFreePlan) {
-      setError('Upgrade to Starter to push to GitHub');
+    if (!canDeployProject) {
+      setError('You are in viewer mode for this project and cannot deploy.');
       return;
     }
 
@@ -366,8 +389,8 @@ export default function DeploymentPage() {
   };
 
   const handleRailwayDeploy = async () => {
-    if (!isProPlan) {
-      setError('Upgrade to Pro to deploy to Railway');
+    if (!canDeployProject) {
+      setError('You are in viewer mode for this project and cannot deploy.');
       return;
     }
 
@@ -451,7 +474,17 @@ export default function DeploymentPage() {
           <section className="mb-6 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
             <p className="text-xs uppercase tracking-wide text-slate-500">Project</p>
             <h2 className="mt-1 text-xl font-semibold text-slate-900">{projectName}</h2>
-            <p className="mt-2 text-sm text-slate-600 capitalize">Plan: {user?.plan || 'free'}</p>
+            <p className="mt-2 text-sm text-slate-600">Access: Unlimited</p>
+            {project?.accessRole && (
+              <p className="mt-1 text-xs uppercase tracking-wide text-slate-500">
+                Role: {project.accessRole}
+              </p>
+            )}
+            {!canDeployProject && (
+              <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                You are in viewer mode for this team project. Deployment actions are disabled.
+              </p>
+            )}
             {!projectId && (
               <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
                 This project does not have a saved projectId yet. ZIP download still works from local generated files, but deploy APIs require generating while logged in.
@@ -483,9 +516,6 @@ export default function DeploymentPage() {
             <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
               <div className="flex items-center justify-between gap-2">
                 <h3 className="text-lg font-semibold text-slate-900">Push to GitHub</h3>
-                {isFreePlan && (
-                  <span className="rounded-full bg-amber-100 px-2 py-1 text-xs text-amber-800">Starter+</span>
-                )}
               </div>
               {!githubToken ? (
                 <button
@@ -516,7 +546,7 @@ export default function DeploymentPage() {
               </label>
               <button
                 onClick={() => void handlePushGithub()}
-                disabled={githubLoading}
+                disabled={githubLoading || !canDeployProject}
                 className="mt-4 rounded-lg bg-slate-900 px-4 py-2 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-60"
               >
                 {githubLoading ? 'Pushing...' : 'Create new repo'}
@@ -536,9 +566,6 @@ export default function DeploymentPage() {
             <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
               <div className="flex items-center justify-between gap-2">
                 <h3 className="text-lg font-semibold text-slate-900">Deploy to Vercel</h3>
-                {isFreePlan && (
-                  <span className="rounded-full bg-amber-100 px-2 py-1 text-xs text-amber-800">Starter+</span>
-                )}
               </div>
               <label className="mt-3 block text-xs text-slate-600">Vercel token</label>
               <input
@@ -550,7 +577,7 @@ export default function DeploymentPage() {
               />
               <button
                 onClick={() => void handleVercelDeploy()}
-                disabled={vercelLoading}
+                disabled={vercelLoading || !canDeployProject}
                 className="mt-4 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500 disabled:opacity-60"
               >
                 {vercelLoading || vercelStatus === 'building' ? 'Deploying...' : 'Deploy to Vercel'}
@@ -573,9 +600,6 @@ export default function DeploymentPage() {
             <article className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm lg:col-span-3">
               <div className="flex items-center justify-between gap-2">
                 <h3 className="text-lg font-semibold text-slate-900">Deploy to Railway</h3>
-                {!isProPlan && (
-                  <span className="rounded-full bg-amber-100 px-2 py-1 text-xs text-amber-800">Pro only</span>
-                )}
               </div>
               <p className="mt-2 text-sm text-slate-600">Requires GitHub repo first.</p>
               <label className="mt-3 block text-xs text-slate-600">Railway token</label>
@@ -588,7 +612,7 @@ export default function DeploymentPage() {
               />
               <button
                 onClick={() => void handleRailwayDeploy()}
-                disabled={railwayLoading}
+                disabled={railwayLoading || !canDeployProject}
                 className="mt-4 rounded-lg bg-violet-600 px-4 py-2 text-sm font-semibold text-white hover:bg-violet-500 disabled:opacity-60"
               >
                 {railwayLoading || railwayStatus === 'building' ? 'Deploying...' : 'Deploy to Railway'}

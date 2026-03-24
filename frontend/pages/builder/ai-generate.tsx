@@ -243,6 +243,13 @@ export default function AIGenerate() {
     const [inviting, setInviting] = useState(false);
     const [inviteMsg, setInviteMsg] = useState('');
     const [deviceMode, setDeviceMode] = useState<'desktop' | 'tablet' | 'mobile'>('desktop');
+    const [useV2Generation] = useState(true);
+    const [generationPhase, setGenerationPhase] = useState('');
+    const [generationMessage, setGenerationMessage] = useState('');
+    const [generationProgress, setGenerationProgress] = useState(0);
+    const [plannedModules, setPlannedModules] = useState<string[]>([]);
+    const [completedModules, setCompletedModules] = useState<string[]>([]);
+    const [generationStatus, setGenerationStatus] = useState<any>({ lastFailover: null });
 
     useEffect(() => {
         const init = async () => {
@@ -368,7 +375,9 @@ export default function AIGenerate() {
         projectFinalizedRef.current = false;
         isRefinement ? setIsRefining(true) : setIsGenerating(true);
 
-        const endpoint = isRefinement ? '/api/ai/refine' : '/api/ai/generate';
+        const endpoint = isRefinement
+            ? '/api/ai/refine'
+            : (useV2Generation ? '/api/ai/generate/v2' : '/api/ai/generate');
         const body = isRefinement
             ? {
                 provider: projectData.aiProvider || 'gemini',
@@ -389,6 +398,13 @@ export default function AIGenerate() {
             };
 
         try {
+            if (!isRefinement) {
+                setGenerationPhase('planning');
+                setGenerationMessage('Preparing generation...');
+                setGenerationProgress(1);
+                setPlannedModules([]);
+                setCompletedModules([]);
+            }
             const token = getToken();
             const headers: Record<string, string> = {
                 'Content-Type': 'application/json'
@@ -433,6 +449,29 @@ export default function AIGenerate() {
                 const dataStr = trimmed.startsWith('data: ') ? trimmed.slice(6) : trimmed.slice(5);
                 try {
                     const data = JSON.parse(dataStr);
+                    const eventType = String(data?.type || '');
+
+                    if (eventType === 'phase') {
+                        if (typeof data.phase === 'string') setGenerationPhase(data.phase);
+                        if (typeof data.message === 'string') setGenerationMessage(data.message);
+                        if (typeof data.progress === 'number') setGenerationProgress(data.progress);
+                    }
+
+                    if (eventType === 'plan') {
+                        if (Array.isArray(data.modules)) setPlannedModules(data.modules.map((m: any) => String(m)));
+                    }
+
+                    if (eventType === 'module_complete' && typeof data.module === 'string') {
+                        setCompletedModules((prev) => prev.includes(data.module) ? prev : [...prev, data.module]);
+                    }
+
+                    if (eventType === 'failover') {
+                        const { phase, from, to, reason } = data;
+                        setGenerationStatus((prev: any) => ({
+                            ...prev,
+                            lastFailover: { phase, from, to, reason, timestamp: Date.now() },
+                        }));
+                    }
 
                     // Stream chunk (for the live preview)
                     if (data.text) {
@@ -472,7 +511,7 @@ export default function AIGenerate() {
                     }
 
                     // Complete event
-                    if (data.fileCount !== undefined || data.tokensUsed !== undefined) {
+                    if (eventType === 'complete' || data.fileCount !== undefined || data.tokensUsed !== undefined) {
                         if (data.projectName) projectMeta.projectName = data.projectName;
                         if (data.description) projectMeta.description = data.description;
                         if (typeof data.projectId === 'string' || data.projectId === null) {
@@ -596,6 +635,7 @@ export default function AIGenerate() {
             setIsGenerating(false);
             setIsRefining(false);
             setProgress(100);
+            setGenerationProgress(100);
         }
     };
 
@@ -1134,8 +1174,55 @@ export default function AIGenerate() {
                                     <div className="w-2.5 h-2.5 rounded-full bg-purple-500 animate-bounce" style={{ animationDelay: '150ms' }} />
                                     <div className="w-2.5 h-2.5 rounded-full bg-pink-500 animate-bounce" style={{ animationDelay: '300ms' }} />
                                 </div>
-                                <p className="text-sm text-slate-600">AI is writing your code... this may take 20-30 seconds</p>
+                                <p className="text-sm text-slate-600">{generationMessage || 'AI is writing your code... this may take 20-30 seconds'}</p>
                             </div>
+
+                            <div className="mb-4">
+                                <div className="flex justify-between text-xs text-slate-500 mb-1">
+                                    <span>{generationPhase || 'generating'}</span>
+                                    <span>{generationProgress}%</span>
+                                </div>
+                                <div className="h-2 bg-slate-200 rounded-full overflow-hidden">
+                                    <div
+                                        className="h-full bg-slate-900 rounded-full transition-all duration-500"
+                                        style={{ width: `${Math.max(0, Math.min(100, generationProgress))}%` }}
+                                    />
+                                </div>
+                            </div>
+
+                            {plannedModules.length > 0 && (
+                                <div className="flex flex-wrap gap-2 justify-center mb-4">
+                                    {plannedModules.map((moduleName) => {
+                                        const done = completedModules.includes(moduleName);
+                                        const active = generationMessage.toLowerCase().includes(moduleName.toLowerCase());
+                                        return (
+                                            <span
+                                                key={moduleName}
+                                                className={`text-xs px-2.5 py-1 rounded-full border ${
+                                                    done
+                                                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                                                        : active
+                                                            ? 'bg-slate-100 text-slate-800 border-slate-300'
+                                                            : 'bg-slate-50 text-slate-500 border-slate-200'
+                                                }`}
+                                            >
+                                                {done ? '✓ ' : ''}{moduleName}
+                                            </span>
+                                        );
+                                    })}
+                                </div>
+                            )}
+
+                            {generationStatus?.lastFailover && (
+                                <div className="flex items-center gap-2 text-xs text-amber-600 bg-amber-50 border border-amber-200 rounded-lg px-3 py-1.5 mb-4">
+                                    <span>⚡</span>
+                                    <span>
+                                        Switched to <strong>{generationStatus.lastFailover.to.split('/').pop()}</strong>
+                                        {' '}during {generationStatus.lastFailover.phase} phase
+                                        {' '}({generationStatus.lastFailover.reason})
+                                    </span>
+                                </div>
+                            )}
 
                             <div
                                 ref={streamBoxRef}

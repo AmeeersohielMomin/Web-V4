@@ -84,6 +84,11 @@ const GEMINI_PLATFORM_FALLBACK_MODELS = [
 // FIX: Default timeout for provider calls to prevent hung connections
 const DEFAULT_GENERATION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 const DEFAULT_NONSTREAMING_TIMEOUT_MS = 60 * 1000;    // 1 minute
+const V2_PLANNER_NONSTREAMING_TIMEOUT_MS = 60 * 1000;
+const V2_MODULE_NONSTREAMING_TIMEOUT_MS = 150 * 1000;
+const V2_SHARED_NONSTREAMING_TIMEOUT_MS = 210 * 1000;
+const OPENAI_SAFE_MAX_COMPLETION_TOKENS = 16384;
+const GITHUB_SAFE_MAX_COMPLETION_TOKENS = 16384;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // TIMEOUT WRAPPER
@@ -141,7 +146,7 @@ function parseJsonLenient<T>(raw: string): T {
     try {
         const repaired = jsonrepair(cleaned);
         if (repaired && repaired !== cleaned) attempts.push(repaired);
-    } catch {}
+    } catch { }
 
     const fallback = stripCodeFences(String(raw || '')).trim();
     if (fallback && !attempts.includes(fallback)) {
@@ -149,7 +154,7 @@ function parseJsonLenient<T>(raw: string): T {
         try {
             const fr = jsonrepair(fallback);
             if (fr && !attempts.includes(fr)) attempts.push(fr);
-        } catch {}
+        } catch { }
     }
 
     let lastError: unknown = null;
@@ -506,14 +511,29 @@ function isUnknownModelError(err: unknown): boolean {
     );
 }
 
+function isTimeoutError(err: unknown): boolean {
+    const msg = String((err as any)?.message || err || '').toLowerCase();
+    return msg.includes('timed out') || msg.includes('timeout');
+}
+
 function getGitHubModelFallbackChain(primaryModel?: string): string[] {
     const primary = normalizeModelForProvider('github', primaryModel) || DEFAULT_MODELS.github;
-    const fallbacks = [
-        primary,
-        'openai/gpt-4.1',
-        'meta/llama-4-maverick',
+
+    // Ordered fallback chain — strongest reliable first, timeout-prone last.
+    // gpt-4o-mini is intentionally LAST because it is the model that times out.
+    const FALLBACK_CHAIN: string[] = [
+        'openai/gpt-4.1',               // Tier 1: strongest reliable, 1M context
+        'openai/gpt-4.1-mini',          // Tier 1: fast, same family
+        'azureml-deepseek/DeepSeek-V3-0324',  // Tier 2: best open-weight for code
+        'meta/llama-4-maverick',         // Tier 2: 256K context, strong instructions
+        'openai/gpt-4o',                 // Tier 3: proven fallback
+        'openai/gpt-4o-mini',            // Tier 3 LAST: slow endpoint, timeout-prone
     ];
-    return Array.from(new Set(fallbacks.filter(Boolean)));
+
+    // Put the user's requested model first, then append the rest of the chain
+    // deduplicating so the requested model is not tried twice.
+    const chain = [primary, ...FALLBACK_CHAIN.filter(m => m !== primary)];
+    return Array.from(new Set(chain.filter(Boolean)));
 }
 
 function getPlatformGeminiKey(): string {
@@ -574,9 +594,84 @@ function normalizeModelForProvider(provider: AIProvider, model?: string): string
         if (/^[a-z0-9-]+\/[a-z0-9-._]+$/i.test(trimmed)) return trimmed;
         if (/^gpt-/i.test(trimmed)) return `openai/${trimmed}`;
         if (/^llama-4-maverick$/i.test(trimmed)) return 'meta/llama-4-maverick';
+        if (/^o4-mini$/i.test(trimmed)) return 'openai/o4-mini';
+        if (/^o3$/i.test(trimmed)) return 'openai/o3';
+        if (/^gpt-5-mini$/i.test(trimmed)) return 'openai/gpt-5-mini';
+        if (/^deepseek-v3/i.test(trimmed)) return 'azureml-deepseek/DeepSeek-V3-0324';
+        if (/^deepseek-r1-0528/i.test(trimmed)) return 'azureml-deepseek/DeepSeek-R1-0528';
+        if (/^deepseek-r1$/i.test(trimmed)) return 'azureml-deepseek/DeepSeek-R1';
+        if (/^codestral/i.test(trimmed)) return 'Codestral-25.01';
+        if (/^mistral-large/i.test(trimmed)) return 'Mistral-Large';
+        if (/^phi-4$/i.test(trimmed)) return 'Phi-4';
         return DEFAULT_MODELS.github;
     }
     return trimmed;
+}
+
+function toModuleLabel(name: string): string {
+    return name
+        .split('-')
+        .filter(Boolean)
+        .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+        .join(' ');
+}
+
+function buildDeterministicPlannerFallbackPlan(
+    userDescription: string,
+    requirements: any,
+    seed: string,
+    colorPalette: { primary: string; secondary: string; accent: string },
+    route: { mode: string; pack: string | null; confidence: number; reasons: string[] },
+): any {
+    const text = String(userDescription || '').toLowerCase();
+    const appType = String(requirements?.appType || deriveAppType(userDescription) || 'other');
+
+    let moduleNames: string[];
+    if (/\bnotes?\b/.test(text)) {
+        moduleNames = ['notes', 'tags', 'shared-notes'];
+    } else if (/\b(task|project|kanban|todo)\b/.test(text)) {
+        moduleNames = ['tasks', 'projects', 'comments'];
+    } else if (/\b(order|product|cart|checkout|store|shop)\b/.test(text)) {
+        moduleNames = ['products', 'categories', 'orders'];
+    } else if (/\b(book|appointment|schedule|reservation)\b/.test(text)) {
+        moduleNames = ['services', 'bookings', 'availability'];
+    } else if (Array.isArray(requirements?.coreFeatures) && requirements.coreFeatures.length > 0) {
+        moduleNames = requirements.coreFeatures
+            .map((feature: any) => String(feature || '').toLowerCase())
+            .map((feature: string) => feature.replace(/[^a-z0-9\s-]/g, ' ').trim())
+            .map((feature: string) => feature.split(/\s+/).find((part) => part.length > 3) || '')
+            .map((part: string) => part.replace(/[^a-z0-9-]/g, '-'))
+            .filter(Boolean)
+            .slice(0, 3);
+
+        if (moduleNames.length < 2) {
+            moduleNames = ['records', 'categories', 'analytics'];
+        }
+    } else {
+        moduleNames = ['records', 'categories', 'analytics'];
+    }
+
+    const uniqueModuleNames = Array.from(new Set(moduleNames.map((name) => String(name || '').toLowerCase()))).slice(0, 4);
+    const modules = uniqueModuleNames.map((name) => ({
+        name,
+        label: toModuleLabel(name),
+        fields: ['name', 'description', 'status', 'createdAt'],
+    }));
+
+    return {
+        projectName: String(requirements?.projectName || 'my-app'),
+        appType,
+        modules,
+        colorPalette,
+        _seed: seed,
+        _domainRouting: {
+            mode: route.mode,
+            pack: route.pack,
+            confidence: route.confidence,
+            reasons: route.reasons,
+        },
+        _plannerFallback: true,
+    };
 }
 
 function buildJsonRepairPrompt(rawModelOutput: string, schemaDescription: string): string {
@@ -595,6 +690,37 @@ Original output:
 """
 ${rawModelOutput}
 """`;
+}
+
+function buildCompactModulePrompt(moduleSpec: { name: string; label?: string; fields?: string[] }, plan: any): string {
+    const moduleName = String(moduleSpec?.name || 'module').toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    const moduleLabel = String(moduleSpec?.label || moduleName);
+    const fields = Array.isArray(moduleSpec?.fields) ? moduleSpec.fields.slice(0, 8).join(', ') : 'name, description, status';
+    const projectName = String(plan?.projectName || 'my-app');
+
+    return [
+        'Generate ONLY JSON. No markdown.',
+        `Project: ${projectName}`,
+        `Module: ${moduleName}`,
+        `Label: ${moduleLabel}`,
+        `Fields: ${fields}`,
+        'Create concise but working files for Express + TypeScript + Mongoose + Next.js Pages Router.',
+        'Required files (exactly 9):',
+        `- backend/src/modules/${moduleName}/${moduleName}.schema.ts`,
+        `- backend/src/modules/${moduleName}/${moduleName}.model.ts`,
+        `- backend/src/modules/${moduleName}/${moduleName}.service.ts`,
+        `- backend/src/modules/${moduleName}/${moduleName}.controller.ts`,
+        `- backend/src/modules/${moduleName}/${moduleName}.routes.ts`,
+        `- frontend/src/services/${moduleName}.service.ts`,
+        `- frontend/pages/${moduleName}/index.tsx`,
+        `- frontend/pages/${moduleName}/new.tsx`,
+        `- frontend/pages/${moduleName}/[id]/edit.tsx`,
+        'Rules:',
+        '- No placeholder literals like xxx or your-...-here.',
+        '- Do not use browser alert().',
+        '- Keep code short and compile-safe.',
+        'Output shape: {"files":[{"path":"...","content":"...","language":"typescript|css|text"}]}',
+    ].join('\n');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -681,7 +807,7 @@ async function generateWithOpenAI(
                 const stream = await client.chat.completions.create({
                     model: modelName,
                     messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
-                    stream: true, temperature, max_tokens: 32768,
+                    stream: true, temperature, max_tokens: OPENAI_SAFE_MAX_COMPLETION_TOKENS,
                 });
                 let full = '';
                 for await (const chunk of stream) {
@@ -701,7 +827,7 @@ async function generateWithOpenAI(
             const response = await client.chat.completions.create({
                 model: modelName,
                 messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
-                temperature, max_tokens: 32768,
+                temperature, max_tokens: OPENAI_SAFE_MAX_COMPLETION_TOKENS,
             });
             return response.choices[0]?.message?.content || '';
         })(),
@@ -884,7 +1010,7 @@ async function generateWithOllama(
                             const text = json.message?.content || '';
                             fullText += text;
                             if (text) onChunk(text);
-                        } catch {}
+                        } catch { }
                     }
                 }
                 return fullText;
@@ -966,7 +1092,7 @@ async function generateWithGitHubModels(
                         const stream = await client.chat.completions.create({
                             model: modelName,
                             messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
-                            stream: true, temperature, max_tokens: 32768,
+                            stream: true, temperature, max_tokens: GITHUB_SAFE_MAX_COMPLETION_TOKENS,
                         });
                         let full = '';
                         for await (const chunk of stream) {
@@ -986,7 +1112,7 @@ async function generateWithGitHubModels(
                     const response = await client.chat.completions.create({
                         model: modelName,
                         messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userMessage }],
-                        temperature, max_tokens: 32768,
+                        temperature, max_tokens: GITHUB_SAFE_MAX_COMPLETION_TOKENS,
                     });
                     return response.choices[0]?.message?.content || '';
                 })(),
@@ -1010,6 +1136,20 @@ async function generateWithGitHubModels(
 // ─────────────────────────────────────────────────────────────────────────────
 // AI SERVICE
 // ─────────────────────────────────────────────────────────────────────────────
+
+function getModuleTimeoutMs(provider: string): number {
+    const p = String(provider || '').toLowerCase();
+    if (p === 'github' || p === 'nvidia') return 90_000;
+    if (p === 'gemini' || p === 'openai') return 120_000;
+    if (p === 'anthropic') return 120_000;
+    return V2_MODULE_NONSTREAMING_TIMEOUT_MS;
+}
+
+function getSharedTimeoutMs(provider: string): number {
+    const p = String(provider || '').toLowerCase();
+    if (p === 'github' || p === 'nvidia') return 120_000;
+    return V2_SHARED_NONSTREAMING_TIMEOUT_MS;
+}
 
 export class AIService {
     async generate(req: GenerateRequest, onChunk?: (chunk: string) => void): Promise<string> {
@@ -1035,6 +1175,262 @@ export class AIService {
         }
     }
 
+    // Two-phase generation: planner
+    async planApplication(
+        userDescription: string,
+        requirements: any,
+        provider: string,
+        model?: string,
+        apiKey?: string
+    ): Promise<any> {
+        const { buildPlannerPrompt, getColorPaletteFromSeed } = await import('./ai.prompts');
+        const { routeDomainPack } = await import('./ai.domainRouter');
+        const seed = randomUUID().slice(0, 8);
+        const prompt = buildPlannerPrompt(userDescription, requirements);
+        const colorPalette = getColorPaletteFromSeed(seed);
+        const route = routeDomainPack(userDescription);
+
+        let raw = '';
+        try {
+            raw = await this.generateNonStreaming({
+                provider,
+                model,
+                apiKey,
+                prompt,
+                maxTokens: 1800,
+                temperature: 0.15,
+                forceJson: true,
+                timeoutMs: V2_PLANNER_NONSTREAMING_TIMEOUT_MS,
+            });
+        } catch (plannerErr) {
+            if (isTimeoutError(plannerErr) || isQuotaOrRateLimitError(plannerErr)) {
+                return buildDeterministicPlannerFallbackPlan(userDescription, requirements, seed, colorPalette, route);
+            }
+            throw plannerErr;
+        }
+
+        let plan: any;
+        try {
+            plan = parseJsonLenient<any>(raw);
+        } catch {
+            try {
+                const repaired = await this.generateNonStreaming({
+                    provider,
+                    model,
+                    apiKey,
+                    prompt: buildJsonRepairPrompt(raw, '{ "projectName":"string","appType":"string","modules":[{"name":"string","label":"string","fields":["string"]}] }'),
+                    maxTokens: 2200,
+                    temperature: 0,
+                    forceJson: true,
+                    timeoutMs: V2_PLANNER_NONSTREAMING_TIMEOUT_MS,
+                });
+                plan = parseJsonLenient<any>(repaired);
+            } catch (repairErr) {
+                if (isTimeoutError(repairErr) || isQuotaOrRateLimitError(repairErr)) {
+                    return buildDeterministicPlannerFallbackPlan(userDescription, requirements, seed, colorPalette, route);
+                }
+                throw repairErr;
+            }
+        }
+
+        const modules = Array.isArray(plan?.modules) ? plan.modules : [];
+
+        return {
+            projectName: String(plan?.projectName || requirements?.projectName || 'my-app'),
+            appType: String(plan?.appType || requirements?.appType || 'other'),
+            modules: modules
+                .map((m: any, i: number) => ({
+                    name: String(m?.name || `module-${i + 1}`).toLowerCase().replace(/[^a-z0-9-]/g, '-'),
+                    label: String(m?.label || m?.name || `Module ${i + 1}`),
+                    fields: Array.isArray(m?.fields) ? m.fields.map((f: any) => String(f)).filter(Boolean).slice(0, 12) : [],
+                }))
+                .slice(0, 8),
+            colorPalette: getColorPaletteFromSeed(seed),
+            _seed: seed,
+            _domainRouting: {
+                mode: route.mode,
+                pack: route.pack,
+                confidence: route.confidence,
+                reasons: route.reasons,
+            },
+        };
+    }
+
+    // Two-phase generation: per module
+    async generateModuleFiles(
+        moduleSpec: { name: string; label?: string; fields?: string[] },
+        plan: any,
+        provider: string,
+        model?: string,
+        apiKey?: string
+    ): Promise<Array<{ path: string; content: string; language: string }>> {
+        const normalizeFiles = (input: any): Array<{ path: string; content: string; language: string }> => {
+            const files = Array.isArray(input?.files) ? input.files : [];
+            return files
+                .filter((f: any) => f && typeof f.path === 'string')
+                .map((f: any) => ({
+                    path: String(f.path),
+                    content: typeof f.content === 'string' ? f.content : JSON.stringify(f.content ?? '', null, 2),
+                    language: typeof f.language === 'string' ? f.language : 'text',
+                }));
+        };
+
+        const { buildModulePrompt } = await import('./ai.prompts');
+        const normalizedProvider = String(provider || '').toLowerCase();
+        const normalizedModel = String(model || '').toLowerCase();
+        const useCompactPrompt = normalizedProvider === 'github' && normalizedModel.includes('gpt-4o-mini');
+        const prompt = useCompactPrompt
+            ? buildCompactModulePrompt(moduleSpec, plan)
+            : buildModulePrompt(moduleSpec, plan, String(plan?._seed || 'default'));
+        let raw = '';
+        let moduleLastError: unknown = null;
+        const moduleTokenBudgets = useCompactPrompt ? [3200, 2400, 1800] : [7000, 5000, 3500];
+        for (const maxTokens of moduleTokenBudgets) {
+            try {
+                raw = await this.generateNonStreaming({
+                    provider,
+                    model,
+                    apiKey,
+                    prompt,
+                    maxTokens,
+                    temperature: 0.2,
+                    forceJson: true,
+                    timeoutMs: getModuleTimeoutMs(provider),
+                });
+                if (String(raw || '').trim().length > 0) break;
+            } catch (err: any) {
+                moduleLastError = err;
+                const errMsg = String(err?.message || '').toLowerCase();
+                const isTokenLimitError =
+                    errMsg.includes('context_length_exceeded') ||
+                    errMsg.includes('maximum context') ||
+                    errMsg.includes('reduce the length') ||
+                    errMsg.includes('too many tokens') ||
+                    errMsg.includes('input too long');
+
+                if (!isTokenLimitError) {
+                    break;
+                }
+            }
+        }
+
+        if (!String(raw || '').trim()) {
+            const moduleName = moduleSpec?.name || 'unknown';
+            throw new Error(`[ai.service] Module generation call failed for ${moduleName}: ${(moduleLastError as any)?.message || 'unknown error'}`);
+        }
+
+        try {
+            const parsed = parseJsonLenient<any>(raw);
+            const normalized = normalizeFiles(parsed);
+            if (normalized.length > 0) return normalized;
+        } catch { }
+
+        try {
+            const repairedRaw = await this.generateNonStreaming({
+                provider,
+                model,
+                apiKey,
+                prompt: buildJsonRepairPrompt(
+                    raw,
+                    '{ "module": "string", "files": [{ "path": "string", "content": "string", "language": "string" }] }',
+                ),
+                maxTokens: 9000,
+                temperature: 0,
+                forceJson: true,
+                timeoutMs: V2_MODULE_NONSTREAMING_TIMEOUT_MS,
+            });
+            const repairedParsed = parseJsonLenient<any>(repairedRaw);
+            const repairedNormalized = normalizeFiles(repairedParsed);
+            if (repairedNormalized.length > 0) return repairedNormalized;
+        } catch { }
+
+        throw new Error(`Module generation produced no files for module "${moduleSpec?.name || 'unknown'}"`);
+    }
+
+    // Two-phase generation: shared project files
+    async generateSharedFiles(
+        plan: any,
+        provider: string,
+        model?: string,
+        apiKey?: string
+    ): Promise<Array<{ path: string; content: string; language: string }>> {
+        const normalizeFiles = (input: any): Array<{ path: string; content: string; language: string }> => {
+            const files = Array.isArray(input?.files) ? input.files : [];
+            return files
+                .filter((f: any) => f && typeof f.path === 'string')
+                .map((f: any) => ({
+                    path: String(f.path),
+                    content: typeof f.content === 'string' ? f.content : JSON.stringify(f.content ?? '', null, 2),
+                    language: typeof f.language === 'string' ? f.language : 'text',
+                }));
+        };
+
+        const { buildSharedFilesPrompt } = await import('./ai.prompts');
+        const prompt = buildSharedFilesPrompt(plan, String(plan?._seed || 'default'));
+        let raw = '';
+        const sharedTokenBudgets = [9000, 6500, 4500];
+        let sharedCallLastError: unknown = null;
+        for (const maxTokens of sharedTokenBudgets) {
+            try {
+                raw = await this.generateNonStreaming({
+                    provider,
+                    model,
+                    apiKey,
+                    prompt,
+                    maxTokens,
+                    temperature: 0.2,
+                    forceJson: true,
+                    timeoutMs: getSharedTimeoutMs(provider),
+                });
+                if (String(raw || '').trim().length > 0) break;
+            } catch (err: any) {
+                sharedCallLastError = err;
+                const errMsg = String(err?.message || '').toLowerCase();
+                const isTokenLimitError =
+                    errMsg.includes('context_length_exceeded') ||
+                    errMsg.includes('maximum context') ||
+                    errMsg.includes('reduce the length') ||
+                    errMsg.includes('too many tokens') ||
+                    errMsg.includes('input too long');
+
+                if (!isTokenLimitError) {
+                    break;
+                }
+            }
+        }
+
+        if (!String(raw || '').trim()) {
+            throw new Error(`[ai.service] Shared file generation call failed: ${(sharedCallLastError as any)?.message || 'unknown error'}`);
+        }
+
+        try {
+            const parsed = parseJsonLenient<any>(raw);
+            const normalized = normalizeFiles(parsed);
+            if (normalized.length > 0) return normalized;
+        } catch { }
+
+        try {
+            const repairedRaw = await this.generateNonStreaming({
+                provider,
+                model,
+                apiKey,
+                prompt: buildJsonRepairPrompt(
+                    raw,
+                    '{ "shared": true, "files": [{ "path": "string", "content": "string", "language": "string" }] }',
+                ),
+                maxTokens: 6000,
+                temperature: 0,
+                forceJson: true,
+                timeoutMs: V2_SHARED_NONSTREAMING_TIMEOUT_MS,
+            });
+            const repairedParsed = parseJsonLenient<any>(repairedRaw);
+            const repairedNormalized = normalizeFiles(repairedParsed);
+            if (repairedNormalized.length > 0) return repairedNormalized;
+        } catch { }
+
+        throw new Error('Shared file generation produced no files');
+    }
+
     // FIX: Unified non-streaming method — no copy-paste fallback logic per caller
     private async generateNonStreaming(params: NonStreamingParams): Promise<string> {
         const provider = params.provider as AIProvider;
@@ -1043,7 +1439,7 @@ export class AIService {
         const resolvedModel = provider === 'gemini'
             ? safeGeminiModel(params.model, isUsingPlatformKey)
             : (normalizeModelForProvider(provider, params.model) || DEFAULT_MODELS[provider]);
-        const systemPrompt = `You are a helpful AI assistant. Return only valid JSON when asked.`;
+        const systemPrompt = `You are an expert full-stack developer for the IDEA platform. Return only valid JSON when asked.`;
 
         // Gemini gets the full fallback chain; other providers call once with timeout
         if (provider === 'gemini') {
@@ -1055,7 +1451,15 @@ export class AIService {
 
         switch (provider) {
             case 'openai':
-                return this.callOpenAiNonStreaming(resolvedKey, resolvedModel, params.prompt, params.maxTokens, params.temperature, Boolean(params.forceJson));
+                return this.callOpenAiNonStreaming(
+                    resolvedKey,
+                    resolvedModel,
+                    params.prompt,
+                    params.maxTokens,
+                    params.temperature,
+                    Boolean(params.forceJson),
+                    params.timeoutMs,
+                );
             case 'anthropic':
                 return generateWithAnthropic(resolvedKey, resolvedModel, systemPrompt, params.prompt, undefined, params.temperature ?? 0.2);
             case 'ollama':
@@ -1063,7 +1467,15 @@ export class AIService {
             case 'nvidia':
                 return generateWithNvidia(resolvedKey, resolvedModel, systemPrompt, params.prompt, undefined, params.temperature ?? 0.2);
             case 'github':
-                return this.callGitHubModelsNonStreaming(resolvedKey, resolvedModel, params.prompt, params.maxTokens, params.temperature, Boolean(params.forceJson));
+                return this.callGitHubModelsNonStreaming(
+                    resolvedKey,
+                    resolvedModel,
+                    params.prompt,
+                    params.maxTokens,
+                    params.temperature,
+                    Boolean(params.forceJson),
+                    params.timeoutMs,
+                );
             default:
                 throw new Error(`Unknown provider: ${params.provider}`);
         }
@@ -1229,7 +1641,7 @@ export class AIService {
 
     private async callOpenAiNonStreaming(
         apiKey: string, model: string, prompt: string,
-        maxTokens: number, temperature: number, forceJson = false,
+        maxTokens: number, temperature: number, forceJson = false, timeoutMs = DEFAULT_NONSTREAMING_TIMEOUT_MS,
     ): Promise<string> {
         const client = new OpenAI({ apiKey });
         const modelName = normalizeModelForProvider('openai', model) || DEFAULT_MODELS.openai;
@@ -1241,19 +1653,19 @@ export class AIService {
                     try {
                         const r = await client.chat.completions.create({ ...base, response_format: { type: 'json_object' } } as any);
                         return r.choices[0]?.message?.content || '';
-                    } catch {}
+                    } catch { }
                 }
                 const r = await client.chat.completions.create(base as any);
                 return r.choices[0]?.message?.content || '';
             })(),
-            DEFAULT_NONSTREAMING_TIMEOUT_MS,
+            timeoutMs,
             `OpenAI-NS/${modelName}`,
         );
     }
 
     private async callGitHubModelsNonStreaming(
         apiKey: string, model: string, prompt: string,
-        maxTokens: number, temperature: number, forceJson = false,
+        maxTokens: number, temperature: number, forceJson = false, timeoutMs = DEFAULT_NONSTREAMING_TIMEOUT_MS,
     ): Promise<string> {
         const client = createGitHubModelsClient(apiKey);
         const modelsToTry = getGitHubModelFallbackChain(model);
@@ -1268,17 +1680,18 @@ export class AIService {
                             try {
                                 const r = await client.chat.completions.create({ ...base, response_format: { type: 'json_object' } } as any);
                                 return r.choices[0]?.message?.content || '';
-                            } catch {}
+                            } catch { }
                         }
                         const r = await client.chat.completions.create(base as any);
                         return r.choices[0]?.message?.content || '';
                     })(),
-                    DEFAULT_NONSTREAMING_TIMEOUT_MS,
+                    timeoutMs,
                     `GitHub-NS/${modelName}`,
                 );
             } catch (err) {
                 lastError = err;
-                if (isUnknownModelError(err)) {
+                // Retry next fallback model for unknown-model and transient timeout failures.
+                if (isUnknownModelError(err) || isTimeoutError(err)) {
                     continue;
                 }
                 throw err;

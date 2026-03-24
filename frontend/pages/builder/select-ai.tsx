@@ -14,11 +14,43 @@ import type { RequirementsDocument } from '../../types/generation';
 const PROVIDER_MODELS: Record<string, string[]> = {
   gemini: ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro'],
   openai: ['gpt-4.1', 'gpt-4.1-mini', 'gpt-4o'],
-  github: ['openai/gpt-4.1', 'meta/llama-4-maverick'],
+  github: ['openai/gpt-4.1', 'openai/gpt-4.1-mini', 'azureml-deepseek/DeepSeek-V3-0324', 'meta/llama-4-maverick'], // Fallback array; grouped UI overrides this
   anthropic: ['claude-sonnet-4-20250514', 'claude-3-7-sonnet-20250219', 'claude-3-5-haiku-20241022'],
   ollama: ['qwen2.5-coder:14b', 'qwen2.5-coder', 'llama3.3', 'deepseek-r1'],
   nvidia: ['nvidia/nemotron-3-super-120b-a12b', 'meta/llama-3.1-405b-instruct', 'meta/llama-3.3-70b-instruct', 'meta/llama-3.1-70b-instruct']
 };
+
+const GITHUB_MODEL_GROUPS = [
+    {
+        label: '⚡ Tier 1 — Strongest',
+        models: [
+            { id: 'openai/gpt-4.1',     name: 'GPT-4.1',                 badge: 'Recommended', speed: 'fast',    quality: 'Highest' },
+            { id: 'openai/o4-mini',      name: 'o4-mini (Reasoning)',      badge: 'Best Planner', speed: 'medium', quality: 'Highest' },
+            { id: 'openai/o3',           name: 'o3',                       badge: 'Reasoning',   speed: 'slow',   quality: 'Highest' },
+            { id: 'openai/gpt-5-mini',   name: 'GPT-5 mini (Preview)',     badge: 'Preview',     speed: 'fastest', quality: 'High'   },
+        ],
+    },
+    {
+        label: '🔓 Tier 2 — Open Weight',
+        models: [
+            { id: 'azureml-deepseek/DeepSeek-V3-0324',  name: 'DeepSeek V3',              badge: 'Open',          speed: 'fast',   quality: 'Highest' },
+            { id: 'azureml-deepseek/DeepSeek-R1-0528',  name: 'DeepSeek R1 0528',         badge: 'Open Reasoning', speed: 'medium', quality: 'Highest' },
+            { id: 'azureml-deepseek/DeepSeek-R1',       name: 'DeepSeek R1',              badge: 'Open Reasoning', speed: 'medium', quality: 'High'   },
+            { id: 'meta/llama-4-maverick',               name: 'Llama 4 Maverick (256K)',  badge: 'Open',          speed: 'medium', quality: 'High'   },
+        ],
+    },
+    {
+        label: '🚀 Tier 3 — Fast',
+        models: [
+            { id: 'openai/gpt-4.1-mini',  name: 'GPT-4.1 mini',    badge: 'Fast',      speed: 'fastest', quality: 'High' },
+            { id: 'openai/gpt-4o',        name: 'GPT-4o',           badge: '',          speed: 'fast',    quality: 'High' },
+            { id: 'Mistral-Large',        name: 'Mistral Large',    badge: 'Open',      speed: 'medium',  quality: 'High' },
+            { id: 'Codestral-25.01',      name: 'Codestral',        badge: 'Code',      speed: 'fastest', quality: 'High' },
+            { id: 'Phi-4',               name: 'Phi-4 (14B)',       badge: 'Lightweight', speed: 'fastest', quality: 'Good' },
+            { id: 'openai/gpt-4o-mini',   name: 'GPT-4o mini',      badge: '⚠ Slow',   speed: 'fast',    quality: 'Good' },
+        ],
+    },
+];
 
 const PROVIDER_LABELS: Record<string, string> = {
   gemini: 'Google Gemini',
@@ -136,9 +168,16 @@ export default function SelectAiPage() {
   }, []);
 
   useEffect(() => {
-    const models = PROVIDER_MODELS[provider] || [];
-    if (models.length > 0 && !models.includes(model)) {
-      setModel(models[0]);
+    if (provider === 'github') {
+        const githubModels = GITHUB_MODEL_GROUPS.flatMap(g => g.models.map(m => m.id));
+        if (githubModels.length > 0 && !githubModels.includes(model)) {
+            setModel('openai/gpt-4.1');
+        }
+    } else {
+        const models = PROVIDER_MODELS[provider] || [];
+        if (models.length > 0 && !models.includes(model)) {
+          setModel(models[0]);
+        }
     }
   }, [provider, model]);
 
@@ -267,7 +306,13 @@ export default function SelectAiPage() {
               <label className="mb-1 block text-xs font-semibold uppercase tracking-wide text-slate-500">AI Provider</label>
               <select
                 value={provider}
-                onChange={(e) => setProvider(e.target.value)}
+                onChange={(e) => {
+                  const newProvider = e.target.value;
+                  setProvider(newProvider);
+                  if (newProvider === 'github') {
+                    setModel('openai/gpt-4.1');
+                  }
+                }}
                 className="h-10 w-full rounded-lg border border-slate-300 px-3 text-sm text-slate-800 focus:border-slate-500 focus:outline-none"
               >
                 {Object.keys(PROVIDER_MODELS).map((p) => (
@@ -283,9 +328,21 @@ export default function SelectAiPage() {
                 onChange={(e) => setModel(e.target.value)}
                 className="h-10 w-full rounded-lg border border-slate-300 px-3 text-sm text-slate-800 focus:border-slate-500 focus:outline-none"
               >
-                {(PROVIDER_MODELS[provider] || []).map((m) => (
-                  <option key={m} value={m}>{m}</option>
-                ))}
+                {provider === 'github' ? (
+                  GITHUB_MODEL_GROUPS.map((group) => (
+                    <optgroup key={group.label} label={group.label}>
+                      {group.models.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.name} {m.badge ? `(${m.badge})` : ''}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))
+                ) : (
+                  (PROVIDER_MODELS[provider] || []).map((m) => (
+                    <option key={m} value={m}>{m}</option>
+                  ))
+                )}
               </select>
             </div>
 

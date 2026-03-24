@@ -5,8 +5,78 @@ import { platformProjectsService } from '../platform-projects/platform-projects.
 import { platformAuthService } from '../platform-auth/platform-auth.service';
 import { detectExternalServices } from './ai.prompts';
 import { track } from '../../utils/telemetry';
+import { validateGeneratedFiles } from './ai.validators';
+import { verifyGeneratedProject } from './ai.verification';
 
 type GeneratedFile = { path: string; content: string; language?: string };
+
+function mergeFilesByPath(
+    baseFiles: Array<{ path: string; content: string; language?: string }>,
+    updates: Array<{ path: string; content: string; language?: string }>,
+): Array<{ path: string; content: string; language: string }> {
+    const mergedByPath = new Map<string, { path: string; content: string; language: string }>();
+    for (const file of baseFiles) {
+        mergedByPath.set(file.path.toLowerCase(), {
+            path: file.path,
+            content: file.content,
+            language: file.language || 'text',
+        });
+    }
+    for (const file of updates) {
+        const existing = mergedByPath.get(file.path.toLowerCase());
+        mergedByPath.set(file.path.toLowerCase(), {
+            path: file.path,
+            content: file.content,
+            language: file.language || existing?.language || 'text',
+        });
+    }
+    return Array.from(mergedByPath.values());
+}
+
+function isUserFacingPath(path: string): boolean {
+    const normalized = String(path || '').replace(/\\/g, '/').toLowerCase();
+    return (
+        normalized.includes('frontend/pages/') ||
+        normalized.includes('frontend/components/') ||
+        normalized.includes('frontend/src/services/')
+    );
+}
+
+function applyDeterministicWarningFixes(
+    files: Array<{ path: string; content: string; language?: string }>,
+): Array<{ path: string; content: string; language: string }> {
+    return files.map((file) => {
+        const normalizedPath = String(file.path || '').replace(/\\/g, '/').toLowerCase();
+        let content = String(file.content || '');
+
+        if (isUserFacingPath(file.path)) {
+            // Replace common placeholder literals that often survive model polishing.
+            content = content
+                .replace(/(["'])your-[^"']*-here\1/gi, '$1sample-value$1')
+                .replace(/(["'])xxx\1/gi, '$1sample-value$1')
+                .replace(/\bPLACEHOLDER\b/g, 'SAMPLE_VALUE');
+
+            // Normalize TODO markers that are surfaced as warning-only lint signals.
+            content = content.replace(/\bTODO:/g, 'NOTE:');
+        }
+
+        if (/frontend\/pages\/.+\.(tsx|jsx|ts|js)$/.test(normalizedPath)) {
+            // Avoid browser alert() in generated pages; prefer non-blocking logs/toasts.
+            content = content.replace(/(^|[^a-zA-Z0-9_$.])alert\s*\(/g, '$1console.warn(');
+
+            // Remove common commented API markers used in generated pages.
+            content = content
+                .replace(/\/\/\s+import\s+/g, 'import ')
+                .replace(/\/\/\s+await\s+/g, 'await ');
+        }
+
+        return {
+            path: file.path,
+            content,
+            language: file.language || 'text',
+        };
+    });
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FILE NORMALISATION
@@ -195,6 +265,85 @@ function normalizeSelectedModules(input: unknown): string[] {
     return Array.from(new Set(
         input.map((m) => String(m || '').trim().toLowerCase()).filter(Boolean),
     ));
+}
+
+function classifyGenerationError(err: unknown): string {
+    const msg = String((err as any)?.message || err || '').toLowerCase();
+    if (msg.includes('timed out') || msg.includes('timeout') || msg.includes('terminated')) return 'timeout';
+    if (msg.includes('quota') || msg.includes('rate limit') || msg.includes('429')) return 'rate_limit';
+    if (msg.includes('invalid api key') || msg.includes('unauthorized') || msg.includes('401')) return 'auth';
+    if (msg.includes('unknown model') || msg.includes('model not found') || msg.includes('404')) return 'model';
+    if (msg.includes('json') || msg.includes('parse')) return 'parse';
+    return 'runtime';
+}
+
+type ProviderModelCandidate = {
+    provider: string;
+    model?: string;
+    reason: string;
+};
+
+function buildModelCandidatesForProvider(provider: string, model?: string): string[] {
+    const normalizedProvider = String(provider || '').toLowerCase();
+    const normalizedModel = String(model || '').trim();
+    if (normalizedProvider === 'github') {
+        // Ordered strongest-first. gpt-4o-mini is last because it consistently times out.
+        const GITHUB_CANDIDATE_POOL: string[] = [
+            'openai/gpt-4.1',
+            'openai/gpt-4.1-mini',
+            'azureml-deepseek/DeepSeek-V3-0324',
+            'meta/llama-4-maverick',
+            'openai/gpt-4o',
+            'openai/gpt-4o-mini',
+        ];
+        // Put user's requested model first; append pool deduped
+        return Array.from(new Set(
+            [normalizedModel, ...GITHUB_CANDIDATE_POOL].filter(Boolean)
+        ));
+    }
+    if (normalizedProvider === 'gemini') {
+        return Array.from(new Set([normalizedModel, 'gemini-2.5-pro', 'gemini-2.0-flash'].filter(Boolean)));
+    }
+    if (normalizedProvider === 'openai') {
+        return Array.from(new Set([normalizedModel, 'gpt-4.1', 'gpt-4o-mini'].filter(Boolean)));
+    }
+    if (normalizedProvider === 'anthropic') {
+        return Array.from(new Set([normalizedModel, 'claude-3-5-sonnet-latest'].filter(Boolean)));
+    }
+    return Array.from(new Set([normalizedModel].filter(Boolean)));
+}
+
+function buildRunCandidates(provider: string, model?: string, canSwitchProvider = false): ProviderModelCandidate[] {
+    const primaryProvider = String(provider || 'gemini').toLowerCase();
+    const candidates: ProviderModelCandidate[] = buildModelCandidatesForProvider(primaryProvider, model)
+        .map((m, idx) => ({
+            provider: primaryProvider,
+            model: m,
+            reason: idx === 0 ? 'requested-model' : `same-provider-fallback-${idx}`,
+        }));
+
+    if (!canSwitchProvider) return candidates;
+
+    const providerFallbackOrder = ['github', 'openai', 'gemini'];
+    for (const fallbackProvider of providerFallbackOrder) {
+        if (fallbackProvider === primaryProvider) continue;
+        const fallbackModels = buildModelCandidatesForProvider(fallbackProvider, undefined);
+        for (const fallbackModel of fallbackModels) {
+            candidates.push({
+                provider: fallbackProvider,
+                model: fallbackModel,
+                reason: `cross-provider-fallback-${fallbackProvider}`,
+            });
+        }
+    }
+
+    const seen = new Set<string>();
+    return candidates.filter((candidate) => {
+        const key = `${candidate.provider}::${candidate.model || ''}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
 }
 
 function isExplicitAuthOnlyIntent(text: string): boolean {
@@ -917,6 +1066,548 @@ export class AIController {
         }
     }
 
+    // POST /api/ai/generate/v2
+    generateV2 = async (req: Request, res: Response): Promise<void> => {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.flushHeaders();
+
+        const send = (type: string, data: Record<string, any>) => {
+            try {
+                res.write(`data: ${JSON.stringify({ type, ...data })}\n\n`);
+            } catch {
+                // Client may disconnect during streaming.
+            }
+        };
+
+        try {
+            const {
+                userPrompt,
+                provider = 'gemini',
+                model,
+                apiKey,
+                projectName: requestedName,
+                requirements = null,
+            } = req.body || {};
+
+            if (!userPrompt || String(userPrompt).trim().length < 5) {
+                send('error', { message: 'Please describe your app idea in more detail.' });
+                res.end();
+                return;
+            }
+
+            const normalizedModel = normalizeIncomingModel(provider, model);
+            const runCandidates = buildRunCandidates(provider, normalizedModel, !apiKey);
+            const normalizedProvider = String(provider || '').toLowerCase();
+            const hasExplicitRequestedModel = typeof normalizedModel === 'string' && normalizedModel.trim().length > 0;
+
+            let executionCandidates = runCandidates;
+            if (normalizedProvider === 'github' && hasExplicitRequestedModel) {
+                const requestedFirst = runCandidates.filter(
+                    (c) => c.provider === normalizedProvider && (c.model || '') === normalizedModel,
+                );
+                const sameProviderFallbacks = runCandidates.filter(
+                    (c) => c.provider === normalizedProvider && (c.model || '') !== normalizedModel,
+                );
+                const crossProviderFallbacks = runCandidates.filter(
+                    (c) => c.provider !== normalizedProvider,
+                );
+
+                executionCandidates = [...requestedFirst, ...sameProviderFallbacks, ...crossProviderFallbacks];
+
+                if (executionCandidates.length < 3) {
+                    const geminiExists = executionCandidates.some((c) => c.provider === 'gemini');
+                    if (!geminiExists) {
+                        executionCandidates.push(
+                            { provider: 'gemini', model: 'gemini-2.5-flash', reason: 'platform-gemini-fallback' },
+                        );
+                    }
+                    const openaiExists = executionCandidates.some(
+                        (c) => c.provider === 'github' && c.model === 'openai/gpt-4.1',
+                    );
+                    if (!openaiExists) {
+                        executionCandidates.push(
+                            { provider: 'github', model: 'openai/gpt-4.1', reason: 'github-gpt4-fallback' },
+                        );
+                    }
+                }
+            }
+
+            const sameProviderPlanningCandidates = runCandidates.filter((candidate) => candidate.provider === normalizedProvider);
+            let planningCandidates = (sameProviderPlanningCandidates.length > 0 ? sameProviderPlanningCandidates : runCandidates)
+                .slice(0, 3);
+
+            // For GitHub Models runs with an explicit model request, keep planning anchored to that model
+            // so planning does not drift to slower fallback models (e.g. gpt-4.1) before generation starts.
+            if (normalizedProvider === 'github' && hasExplicitRequestedModel) {
+                planningCandidates = planningCandidates
+                    .filter((candidate) => (candidate.model || '') === normalizedModel)
+                    .slice(0, 1);
+
+                if (planningCandidates.length === 0) {
+                    planningCandidates = runCandidates
+                        .filter((candidate) => candidate.provider === normalizedProvider)
+                        .slice(0, 1);
+                }
+            }
+            const planningDeadline = Date.now() + (4 * 60 * 1000);
+
+            send('phase', { phase: 'planning', message: 'Analysing your idea...', progress: 5 });
+
+            let plan: any = null;
+            let activeCandidate: ProviderModelCandidate | null = null;
+            let planningLastError: unknown = null;
+            for (let i = 0; i < planningCandidates.length; i++) {
+                if (Date.now() > planningDeadline) {
+                    planningLastError = planningLastError || new Error('Planning budget exceeded.');
+                    break;
+                }
+
+                const candidate = planningCandidates[i];
+                send('phase_diagnostic', {
+                    phase: 'planning',
+                    status: 'attempt_start',
+                    attempt: i + 1,
+                    provider: candidate.provider,
+                    model: candidate.model || null,
+                    reason: candidate.reason,
+                });
+                try {
+                    plan = await aiService.planApplication(
+                        String(userPrompt),
+                        requirements || null,
+                        candidate.provider,
+                        candidate.model,
+                        apiKey
+                    );
+                    activeCandidate = candidate;
+                    send('phase_diagnostic', {
+                        phase: 'planning',
+                        status: 'attempt_success',
+                        attempt: i + 1,
+                        provider: candidate.provider,
+                        model: candidate.model || null,
+                    });
+                    break;
+                } catch (planningErr: any) {
+                    planningLastError = planningErr;
+                    send('phase_diagnostic', {
+                        phase: 'planning',
+                        status: 'attempt_failed',
+                        attempt: i + 1,
+                        provider: candidate.provider,
+                        model: candidate.model || null,
+                        errorType: classifyGenerationError(planningErr),
+                        message: planningErr?.message || 'unknown error',
+                    });
+                }
+            }
+
+            if (!plan || !activeCandidate) {
+                throw new Error(`Planning failed across candidates/time budget: ${(planningLastError as any)?.message || 'unknown error'}`);
+            }
+
+            const modules = Array.isArray(plan?.modules) ? plan.modules : [];
+            send('plan', {
+                projectName: plan?.projectName || requestedName || 'my-app',
+                appType: plan?.appType || 'other',
+                modules: modules.map((m: any) => m?.name).filter(Boolean),
+                moduleCount: modules.length,
+                domainRouting: plan?._domainRouting || null,
+                provider: activeCandidate.provider,
+                model: activeCandidate.model || null,
+            });
+
+            let allFiles: Array<{ path: string; content: string; language: string }> = [];
+            for (let i = 0; i < modules.length; i++) {
+                const mod = modules[i];
+                const progress = 10 + Math.round((i / Math.max(1, modules.length)) * 65);
+                send('phase', {
+                    phase: 'generating',
+                    message: `Building ${mod?.label || mod?.name || `module-${i + 1}`} module...`,
+                    module: mod?.name,
+                    progress,
+                });
+
+                let moduleFiles: Array<{ path: string; content: string; language: string }> = [];
+                let moduleSuccess = false;
+                let moduleLastErr: unknown = null;
+                for (let candidateIndex = 0; candidateIndex < executionCandidates.length; candidateIndex++) {
+                    const candidate = executionCandidates[candidateIndex];
+                    send('phase_diagnostic', {
+                        phase: 'module',
+                        module: mod?.name,
+                        status: 'attempt_start',
+                        attempt: candidateIndex + 1,
+                        provider: candidate.provider,
+                        model: candidate.model || null,
+                    });
+                    try {
+                        moduleFiles = await aiService.generateModuleFiles(mod, plan, candidate.provider, candidate.model, apiKey);
+                        if (moduleFiles.length > 0) {
+                            moduleSuccess = true;
+                            activeCandidate = candidate;
+                            send('phase_diagnostic', {
+                                phase: 'module',
+                                module: mod?.name,
+                                status: 'attempt_success',
+                                attempt: candidateIndex + 1,
+                                provider: candidate.provider,
+                                model: candidate.model || null,
+                                fileCount: moduleFiles.length,
+                            });
+                            break;
+                        }
+                        throw new Error('Module returned zero files');
+                    } catch (moduleErr: any) {
+                        moduleLastErr = moduleErr;
+                        const moduleErrType = classifyGenerationError(moduleErr);
+                        send('phase_diagnostic', {
+                            phase: 'module',
+                            module: mod?.name,
+                            status: 'attempt_failed',
+                            attempt: candidateIndex + 1,
+                            provider: candidate.provider,
+                            model: candidate.model || null,
+                            errorType: moduleErrType,
+                            message: moduleErr?.message || 'unknown error',
+                        });
+
+                        const nextCandidate = executionCandidates[candidateIndex + 1];
+                        if (nextCandidate) {
+                            send('failover', {
+                                phase: 'module',
+                                module: mod?.name,
+                                from: `${candidate.provider}/${candidate.model || ''}`,
+                                to: `${nextCandidate.provider}/${nextCandidate.model || ''}`,
+                                reason: moduleErrType,
+                            });
+                        }
+                    }
+                }
+
+                if (!moduleSuccess) {
+                    throw new Error(`Module "${mod?.name || `module-${i + 1}`}" failed across candidates: ${(moduleLastErr as any)?.message || 'unknown error'}`);
+                }
+
+                if (moduleFiles.length === 0) {
+                    throw new Error(`Module "${mod?.name || `module-${i + 1}`}" generated 0 files after retry`);
+                }
+
+                allFiles.push(...moduleFiles);
+                send('module_complete', {
+                    module: mod?.name,
+                    fileCount: moduleFiles.length,
+                    files: moduleFiles.map((f) => f.path),
+                });
+            }
+
+            send('phase', { phase: 'wiring', message: 'Wiring everything together...', progress: 78 });
+            let sharedFiles: Array<{ path: string; content: string; language: string }> = [];
+            let sharedSuccess = false;
+            let sharedLastErr: unknown = null;
+            for (let candidateIndex = 0; candidateIndex < executionCandidates.length; candidateIndex++) {
+                const candidate = executionCandidates[candidateIndex];
+                send('phase_diagnostic', {
+                    phase: 'shared',
+                    status: 'attempt_start',
+                    attempt: candidateIndex + 1,
+                    provider: candidate.provider,
+                    model: candidate.model || null,
+                });
+                try {
+                    sharedFiles = await aiService.generateSharedFiles(plan, candidate.provider, candidate.model, apiKey);
+                    if (sharedFiles.length > 0) {
+                        sharedSuccess = true;
+                        activeCandidate = candidate;
+                        send('phase_diagnostic', {
+                            phase: 'shared',
+                            status: 'attempt_success',
+                            attempt: candidateIndex + 1,
+                            provider: candidate.provider,
+                            model: candidate.model || null,
+                            fileCount: sharedFiles.length,
+                        });
+                        break;
+                    }
+                    throw new Error('Shared generation returned zero files');
+                } catch (sharedErr: any) {
+                    sharedLastErr = sharedErr;
+                    const sharedErrType = classifyGenerationError(sharedErr);
+                    send('phase_diagnostic', {
+                        phase: 'shared',
+                        status: 'attempt_failed',
+                        attempt: candidateIndex + 1,
+                        provider: candidate.provider,
+                        model: candidate.model || null,
+                        errorType: sharedErrType,
+                        message: sharedErr?.message || 'unknown error',
+                    });
+
+                    const nextSharedCandidate = executionCandidates[candidateIndex + 1];
+                    if (nextSharedCandidate) {
+                        send('failover', {
+                            phase: 'shared',
+                            from: `${candidate.provider}/${candidate.model || ''}`,
+                            to: `${nextSharedCandidate.provider}/${nextSharedCandidate.model || ''}`,
+                            reason: sharedErrType,
+                        });
+                    }
+                }
+            }
+
+            if (!sharedSuccess) {
+                throw new Error(`Shared generation failed across candidates: ${(sharedLastErr as any)?.message || 'unknown error'}`);
+            }
+
+            if (sharedFiles.length === 0) {
+                throw new Error('Shared generation produced 0 files after retry');
+            }
+
+            allFiles.push(...sharedFiles);
+            allFiles = applyDeterministicWarningFixes(allFiles);
+
+            // Static wiring/quality validation report
+            let validation = validateGeneratedFiles(allFiles, plan);
+            send('validation_report', {
+                passed: validation.passed,
+                critical: validation.critical,
+                warnings: validation.warnings,
+            });
+
+            // Blocking verification gate for production quality
+            let verification = await verifyGeneratedProject(allFiles);
+            send('verification_report', verification);
+            if (!verification.passed) {
+                send('phase', {
+                    phase: 'repairing',
+                    message: 'Detected quality issues. Running one auto-repair pass...',
+                    progress: 84,
+                });
+
+                const repairPrompt = [
+                    'Apply targeted fixes only. Do not remove working files.',
+                    'Fix every critical issue below and return ONLY changed files as JSON.',
+                    'Critical issues:',
+                    ...verification.criticalFailures.map((failure, idx) => `${idx + 1}. ${failure}`),
+                    'Rules:',
+                    '- Keep existing project structure intact.',
+                    '- Use toast instead of browser alert().',
+                    '- Remove placeholder literals from user-facing files.',
+                    '- Ensure dashboard calls real services/APIs.',
+                    'Output JSON shape: { "files": [{ "path": "...", "content": "...", "language": "..." }] }',
+                ].join('\n');
+
+                try {
+                    const repairRaw = await aiService.refine({
+                        provider: (activeCandidate?.provider || provider) as AIProvider,
+                        apiKey,
+                        model: activeCandidate?.model || normalizedModel,
+                        previousCode: allFiles.map((file) => ({ path: file.path, content: file.content })),
+                        refinementRequest: repairPrompt,
+                    });
+
+                    const repairedExtraction = extractFilesFromResponse(repairRaw);
+                    const repairedChanges = normalizeGeneratedFiles(repairedExtraction.files)
+                        .map((file) => ({
+                            path: file.path,
+                            content: file.content,
+                            language: file.language || 'text',
+                        }));
+
+                    if (repairedChanges.length > 0) {
+                        allFiles = mergeFilesByPath(allFiles, repairedChanges);
+
+                        send('phase', {
+                            phase: 'repairing',
+                            message: `Applied ${repairedChanges.length} repair updates. Re-validating...`,
+                            progress: 89,
+                        });
+
+                        const repairedValidation = validateGeneratedFiles(allFiles, plan);
+                        validation = repairedValidation;
+                        send('validation_report', {
+                            passed: repairedValidation.passed,
+                            critical: repairedValidation.critical,
+                            warnings: repairedValidation.warnings,
+                            attempt: 'repair-1',
+                        });
+
+                        verification = await verifyGeneratedProject(allFiles);
+                        send('verification_report', {
+                            ...verification,
+                            attempt: 'repair-1',
+                        });
+                    } else {
+                        send('warning', { message: 'Auto-repair returned no file updates.' });
+                    }
+                } catch (repairErr: any) {
+                    send('warning', { message: `Auto-repair failed: ${repairErr?.message || 'unknown error'}` });
+                }
+
+                if (!verification.passed) {
+                    send('error', {
+                        message: 'Generation failed verification gates after auto-repair. Please retry.',
+                        criticalFailures: verification.criticalFailures,
+                    });
+                    res.end();
+                    return;
+                }
+            }
+
+            const maxWarningFixPasses = 3;
+            let warningCount = Array.from(new Set([
+                ...(validation.warnings || []),
+                ...(verification.warnings || []),
+            ])).length;
+
+            for (let pass = 1; pass <= maxWarningFixPasses && warningCount > 0; pass++) {
+                const warningCandidates = Array.from(new Set([
+                    ...(validation.warnings || []),
+                    ...(verification.warnings || []),
+                ])).slice(0, 25);
+
+                if (warningCandidates.length === 0) break;
+
+                send('phase', {
+                    phase: 'polishing',
+                    message: `Polishing warnings (pass ${pass}/${maxWarningFixPasses})...`,
+                    progress: 89 + pass,
+                });
+
+                const warningFixPrompt = [
+                    'Apply targeted warning fixes only. Do not change project structure or working flows.',
+                    `Goal: reduce warnings to zero. Current warning count: ${warningCandidates.length}.`,
+                    'Fix warning issues below and return ONLY changed files as JSON.',
+                    'Warning issues:',
+                    ...warningCandidates.map((warning, idx) => `${idx + 1}. ${warning}`),
+                    'Rules:',
+                    '- Preserve API routes and existing business logic.',
+                    '- Replace placeholder literals with realistic values.',
+                    '- Prefer non-blocking UI feedback over browser alert().',
+                    '- For dashboard API warnings, ensure at least one real service import and useEffect API call exists.',
+                    '- Keep TypeScript/TSX compile-safe.',
+                    'Output JSON shape: { "files": [{ "path": "...", "content": "...", "language": "..." }] }',
+                ].join('\n');
+
+                try {
+                    const warningFixRaw = await aiService.refine({
+                        provider: (activeCandidate?.provider || provider) as AIProvider,
+                        apiKey,
+                        model: activeCandidate?.model || normalizedModel,
+                        previousCode: allFiles.map((file) => ({ path: file.path, content: file.content })),
+                        refinementRequest: warningFixPrompt,
+                    });
+
+                    const warningFixExtraction = extractFilesFromResponse(warningFixRaw);
+                    const warningFixChanges = normalizeGeneratedFiles(warningFixExtraction.files)
+                        .map((file) => ({
+                            path: file.path,
+                            content: file.content,
+                            language: file.language || 'text',
+                        }));
+
+                    if (warningFixChanges.length === 0) {
+                        send('warning', { message: `Warning-fix pass ${pass} returned no file updates.` });
+                        break;
+                    }
+
+                        const candidateFiles = applyDeterministicWarningFixes(
+                            mergeFilesByPath(allFiles, warningFixChanges),
+                        );
+                    const candidateValidation = validateGeneratedFiles(candidateFiles, plan);
+                    const candidateVerification = await verifyGeneratedProject(candidateFiles);
+                    const candidateWarningCount = Array.from(new Set([
+                        ...(candidateValidation.warnings || []),
+                        ...(candidateVerification.warnings || []),
+                    ])).length;
+
+                    if (!candidateVerification.passed) {
+                        send('warning', { message: `Warning-fix pass ${pass} introduced verification issues. Keeping pre-polish files.` });
+                        break;
+                    }
+
+                    if (candidateWarningCount >= warningCount) {
+                        send('warning', { message: `Warning-fix pass ${pass} did not reduce warning count (${warningCount} -> ${candidateWarningCount}). Stopping further polish passes.` });
+                        break;
+                    }
+
+                    allFiles = candidateFiles;
+                    validation = candidateValidation;
+                    verification = candidateVerification;
+                    warningCount = candidateWarningCount;
+
+                    send('phase', {
+                        phase: 'polishing',
+                        message: `Applied ${warningFixChanges.length} warning-fix updates (${warningCount} warnings remaining).`,
+                        progress: 90 + pass,
+                    });
+
+                    send('validation_report', {
+                        passed: validation.passed,
+                        critical: validation.critical,
+                        warnings: validation.warnings,
+                        attempt: `warning-fix-${pass}`,
+                    });
+
+                    send('verification_report', {
+                        ...verification,
+                        attempt: `warning-fix-${pass}`,
+                    });
+
+                    if (warningCount === 0) break;
+                } catch (warningFixErr: any) {
+                    send('warning', { message: `Warning-fix pass ${pass} failed: ${warningFixErr?.message || 'unknown error'}` });
+                    break;
+                }
+            }
+
+            send('phase', { phase: 'finalizing', message: 'Finalizing project...', progress: 92 });
+            for (const file of allFiles) send('file', file);
+
+            let savedProjectId: string | null = null;
+            const authenticatedUserId = (req as any).userId as string | undefined;
+            if (authenticatedUserId) {
+                try {
+                    const project = await platformProjectsService.createProject(authenticatedUserId, {
+                        name: String(plan?.projectName || requestedName || 'my-app'),
+                        description: String(plan?.appType || 'Generated full-stack app'),
+                        modules: modules.map((m: any) => String(m?.name || '')).filter(Boolean),
+                        template: 'modern',
+                        backend: 'jwt-mongodb',
+                        provider: activeCandidate?.provider || provider,
+                    });
+                    const projectId = project._id.toString();
+                    await platformProjectsService.saveFiles(projectId, authenticatedUserId, allFiles);
+                    await platformProjectsService.appendChatEntry(projectId, authenticatedUserId, {
+                        type: 'generate',
+                        prompt: String(userPrompt || ''),
+                    });
+                    await platformAuthService.incrementGenerationCount(authenticatedUserId);
+                    savedProjectId = projectId;
+                } catch (persistErr: any) {
+                    send('warning', { message: `Generated app but failed to save project: ${persistErr?.message || 'unknown'}` });
+                }
+            }
+
+            send('complete', {
+                projectName: plan?.projectName || requestedName || 'my-app',
+                fileCount: allFiles.length,
+                modules: modules.map((m: any) => String(m?.name || '')).filter(Boolean),
+                projectId: savedProjectId,
+                progress: 100,
+                provider: activeCandidate?.provider || provider,
+                model: activeCandidate?.model || normalizedModel || null,
+            });
+            res.end();
+        } catch (err: any) {
+            send('error', { message: err?.message || 'Generation failed' });
+            res.end();
+        }
+    };
+
     // POST /api/ai/design-to-code
     async designToCode(req: Request, res: Response): Promise<void> {
         const { provider, apiKey, model, designJSON, designDescription } = req.body;
@@ -1153,13 +1844,185 @@ export class AIController {
                         id: 'github',
                         name: 'GitHub Models',
                         logo: '🐙',
-                        models: [
-                            { id: 'openai/gpt-4.1', name: 'openai/gpt-4.1', freeTier: false, speed: 'medium', quality: 'highest' },
-                            { id: 'meta/llama-4-maverick', name: 'meta/llama-4-maverick', freeTier: false, speed: 'fast', quality: 'high' },
-                        ],
+                        description: 'Access frontier + open-weight models via a single GitHub token. Requires a GitHub Personal Access Token.',
                         requiresKey: true,
                         freeTierAvailable: false,
-                        description: 'Access OSS and frontier models via GitHub Models. Requires a GitHub token.',
+                        keyLabel: 'GitHub Personal Access Token',
+                        keyPlaceholder: 'ghp_...',
+                        keyHint: 'Create at github.com/settings/tokens — no special permissions needed',
+                        models: [
+                            // ── TIER 1: Strongest ──
+                            {
+                                id: 'openai/gpt-4.1',
+                                name: 'GPT-4.1',
+                                badge: '⚡ Strongest',
+                                tier: 'high',
+                                speed: 'fast',
+                                quality: 'highest',
+                                contextWindow: '1M tokens',
+                                description: 'Best overall. Outperforms GPT-4o on coding, instruction following, and long-context tasks.',
+                                freeTier: false,
+                                recommended: true,
+                            },
+                            {
+                                id: 'openai/o4-mini',
+                                name: 'o4-mini (Reasoning)',
+                                badge: '🧠 Best Planner',
+                                tier: 'high',
+                                speed: 'medium',
+                                quality: 'highest',
+                                contextWindow: '200K tokens',
+                                description: 'Chain-of-thought reasoning model. Best for complex planning and structured output. 93.4% HumanEval.',
+                                freeTier: false,
+                                recommended: false,
+                            },
+                            {
+                                id: 'openai/o3',
+                                name: 'o3',
+                                badge: '🧠 Reasoning',
+                                tier: 'high',
+                                speed: 'slow',
+                                quality: 'highest',
+                                contextWindow: '200K tokens',
+                                description: 'Most powerful reasoning model. Use when o4-mini is unavailable.',
+                                freeTier: false,
+                                recommended: false,
+                            },
+                            {
+                                id: 'openai/gpt-5-mini',
+                                name: 'GPT-5 mini (Preview)',
+                                badge: '🔬 Preview',
+                                tier: 'high',
+                                speed: 'fastest',
+                                quality: 'high',
+                                contextWindow: 'Large',
+                                description: 'Next-gen model in preview. Excellent speed-to-quality ratio.',
+                                freeTier: false,
+                                recommended: false,
+                            },
+                            // ── TIER 2: Strong Open-Weight ──
+                            {
+                                id: 'azureml-deepseek/DeepSeek-V3-0324',
+                                name: 'DeepSeek V3',
+                                badge: '🔓 Open Weight',
+                                tier: 'high',
+                                speed: 'fast',
+                                quality: 'highest',
+                                contextWindow: '128K tokens',
+                                description: 'Best open-weight model for code generation. Excellent JSON instruction adherence.',
+                                freeTier: false,
+                                recommended: false,
+                            },
+                            {
+                                id: 'azureml-deepseek/DeepSeek-R1-0528',
+                                name: 'DeepSeek R1 0528 (Reasoning)',
+                                badge: '🔓 Open Reasoning',
+                                tier: 'high',
+                                speed: 'medium',
+                                quality: 'highest',
+                                contextWindow: '128K tokens',
+                                description: 'Open-weight reasoning model. Ideal for planning phases. 97.3% MATH benchmark.',
+                                freeTier: false,
+                                recommended: false,
+                            },
+                            {
+                                id: 'azureml-deepseek/DeepSeek-R1',
+                                name: 'DeepSeek R1',
+                                badge: '🔓 Open Reasoning',
+                                tier: 'high',
+                                speed: 'medium',
+                                quality: 'high',
+                                contextWindow: '128K tokens',
+                                description: 'Original open-weight reasoning model. Use R1-0528 when available.',
+                                freeTier: false,
+                                recommended: false,
+                            },
+                            {
+                                id: 'meta/llama-4-maverick',
+                                name: 'Llama 4 Maverick',
+                                badge: '🔓 Open Weight',
+                                tier: 'high',
+                                speed: 'fast',
+                                quality: 'high',
+                                contextWindow: '256K tokens',
+                                description: '398B MoE model (94B active). Huge context window. Can be slow on the GitHub endpoint.',
+                                freeTier: false,
+                                recommended: false,
+                            },
+                            // ── TIER 3: Fast / Lightweight ──
+                            {
+                                id: 'openai/gpt-4.1-mini',
+                                name: 'GPT-4.1 mini',
+                                badge: '⚡ Fast',
+                                tier: 'high',
+                                speed: 'fastest',
+                                quality: 'high',
+                                contextWindow: '1M tokens',
+                                description: 'Fastest high-quality model. Best for planning and requirements phases.',
+                                freeTier: false,
+                                recommended: false,
+                            },
+                            {
+                                id: 'openai/gpt-4o',
+                                name: 'GPT-4o',
+                                badge: '',
+                                tier: 'high',
+                                speed: 'fast',
+                                quality: 'high',
+                                contextWindow: 'Large',
+                                description: 'Proven multimodal model. Solid general fallback.',
+                                freeTier: false,
+                                recommended: false,
+                            },
+                            {
+                                id: 'Mistral-Large',
+                                name: 'Mistral Large',
+                                badge: '🔓 Open Weight',
+                                tier: 'low',
+                                speed: 'medium',
+                                quality: 'high',
+                                contextWindow: '256K tokens',
+                                description: 'Strong structured output with very long context. Good for large module prompts.',
+                                freeTier: false,
+                                recommended: false,
+                            },
+                            {
+                                id: 'Codestral-25.01',
+                                name: 'Codestral 25.01',
+                                badge: '💻 Code',
+                                tier: 'low',
+                                speed: 'fastest',
+                                quality: 'high',
+                                contextWindow: 'Large',
+                                description: 'Code-specialised model. Very fast TypeScript generation. Use for refinement tasks.',
+                                freeTier: false,
+                                recommended: false,
+                            },
+                            {
+                                id: 'Phi-4',
+                                name: 'Phi-4 (14B)',
+                                badge: '🔓 Lightweight',
+                                tier: 'low',
+                                speed: 'fastest',
+                                quality: 'good',
+                                contextWindow: 'Moderate',
+                                description: 'Highly capable 14B model. Low latency. Good for fast planning on rate-limited accounts.',
+                                freeTier: false,
+                                recommended: false,
+                            },
+                            {
+                                id: 'openai/gpt-4o-mini',
+                                name: 'GPT-4o mini',
+                                badge: '',
+                                tier: 'low',
+                                speed: 'fast',
+                                quality: 'good',
+                                contextWindow: 'Moderate',
+                                description: 'Lightweight fallback only. Prone to timeouts on large generation tasks.',
+                                freeTier: false,
+                                recommended: false,
+                            },
+                        ],
                     },
                     {
                         id: 'anthropic',

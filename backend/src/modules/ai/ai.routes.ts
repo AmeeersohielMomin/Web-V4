@@ -12,6 +12,11 @@ router.post(
     optionalAuth,
     (req, res) => aiController.generate(req, res)
 );
+router.post(
+    '/generate/v2',
+    optionalAuth,
+    (req, res) => aiController.generateV2(req, res)
+);
 router.post('/design-to-code', (req, res) => aiController.designToCode(req, res));
 router.post('/refine', optionalAuth, (req, res) => aiController.refine(req, res));
 router.post('/chat', optionalAuth, (req, res) => aiController.chat(req, res));

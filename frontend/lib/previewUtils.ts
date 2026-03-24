@@ -139,7 +139,6 @@ export function selectEntryFile(
     const lower = activeFilePath.toLowerCase();
     const isRenderable =
       lower.endsWith('.tsx') || lower.endsWith('.jsx') ||
-      lower.endsWith('.ts') || lower.endsWith('.js') ||
       lower.endsWith('.vue') || lower.endsWith('.html');
     if (isRenderable && paths.includes(activeFilePath)) {
       return activeFilePath;

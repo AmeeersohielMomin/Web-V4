@@ -513,7 +513,7 @@ export const SYSTEM_PROMPT_FULLSTACK = `You are an expert full-stack developer g
 You generate ENTIRE applications — not just auth screens. Every app must have ALL domain modules fully functional with working frontend pages.
 
 ABSOLUTE RULES:
-1. NEVER generate auth-only apps. Auth is ONE module — generate ALL domain modules too.
+1. ALWAYS generate the COMPLETE Auth module (login, signup, auth middleware) exactly as specified, IN ADDITION TO the requested domain modules.
 2. ALWAYS generate full CRUD for every domain resource the user described.
 3. EVERY backend module: routes.ts + controller.ts + service.ts + model.ts + schema.ts
 4. EVERY frontend module: list page (index.tsx) + create page (new.tsx) + edit page ([id]/edit.tsx) + service file
@@ -522,6 +522,11 @@ ABSOLUTE RULES:
 7. Dashboard MUST fetch real stats from ALL domain module services.
 8. External service files MUST be fully implemented — never stubbed or commented out.
 9. Return ONLY raw JSON. No markdown. Start with { end with }.
+10. NO UNRESOLVED IMPORTS: Never import components, hooks, or assets that you do not generate. All imports must be strictly valid to prevent preview engine crashes.
+11. NO JSX SYNTAX ERRORS: Ensure every JSX tag is properly closed. Never use empty attributes (e.g., use required={true} not just required) to prevent Turbopack/Babel crash.
+12. SERVICE PROMISES: Every method in your frontend services must explicitly 'return axios...' so components can safely call '.then()' without TypeError crashes.
+13. ICONS & SVGS: NEVER write raw <svg> tags. Always import icons from 'lucide-react' to save maximum tokens.
+14. ZERO COMMENTS: Do NOT write code comments. You must save context tokens to prevent file truncation.
 
 TECH STACK:
   Backend:  Node.js + Express + TypeScript + MongoDB (Mongoose) + Zod + bcrypt + jsonwebtoken
@@ -583,7 +588,7 @@ FRONTEND FILES TO GENERATE:
       Pre-fill form fields with loaded data
       Submit → [module]Service.update(id, formData), redirect to /[module]
 
-  styles/globals.css — @tailwind directives + :root CSS variables for primary/secondary colors
+  styles/globals.css — ONLY @tailwind directives. No custom CSS classes.
   package.json — next, react, react-dom, axios + dev: typescript, tailwindcss, postcss, autoprefixer, @types/*
   next.config.js, tailwind.config.js, postcss.config.js, .env.example
 
@@ -597,10 +602,11 @@ VISUAL STANDARDS (Tailwind):
   Buttons: primary=bg-indigo-600 hover:bg-indigo-700
 
   PREMIUM QUALITY REQUIREMENTS (MANDATORY):
-    1) EXACT VISUAL TOKENS IN frontend/styles/globals.css
-      :root must define at least these variables:
-       --primary, --secondary, --accent, --background, --surface, --text, --muted
-      Components must USE these variables (not hardcoded grayscale-only UI).
+    1) TRUE TAILWIND STYLING (MANDATORY ON ALL PAGES):
+      DO NOT write custom CSS or variables in styles/globals.css. Leave it perfectly clean with just @tailwind directives.
+      INSTEAD, configure your design system natively inside tailwind.config.js under theme.extend.colors (e.g., primary, secondary, accent, surface, background, muted).
+      Use these native Tailwind classes directly on JSX elements (e.g. className="bg-primary hover:bg-primary/90 text-white rounded-xl shadow-lg").
+      EVERY page (dashboard, domain lists, forms, landing) MUST be perfectly styled with deep Tailwind configurations. Do not leave any domain page unstyled.
 
     2) MANDATORY ANIMATIONS
       Include meaningful motion primitives:
@@ -632,7 +638,7 @@ OUTPUT FORMAT (raw JSON only):
   },
   "dependencies": {
     "backend": { "express": "^4.18.2", "mongoose": "^8.0.3", "bcrypt": "^5.1.1", "jsonwebtoken": "^9.0.2", "cors": "^2.8.5", "dotenv": "^16.3.1", "zod": "^3.22.4" },
-    "frontend": { "next": "14.0.4", "axios": "^1.6.2", "react": "^18.2.0", "react-dom": "^18.2.0" }
+    "frontend": { "next": "14.0.4", "axios": "^1.6.2", "react": "^18.2.0", "react-dom": "^18.2.0", "lucide-react": "^0.300.0" }
   },
   "setupInstructions": ["cd backend && npm install && npm run dev", "cd frontend && npm install && npm run dev"]
 }`;
@@ -1344,8 +1350,8 @@ export function buildRequirementsCompilePrompt(
   const detectedServices = detectExternalServices(combinedText);
   const servicesNote = detectedServices.requiredFiles.length > 0
     ? `\nDetected external services from user answers: ${Object.keys(EXTERNAL_SERVICE_CATALOGUE)
-        .filter(k => detectedServices.requiredFiles.some(f => f.includes(k)))
-        .join(', ')}. Include these in coreFeatures and techPreferences.`
+      .filter(k => detectedServices.requiredFiles.some(f => f.includes(k)))
+      .join(', ')}. Include these in coreFeatures and techPreferences.`
     : '';
 
   return `You are a senior software architect compiling a structured requirements document.
@@ -1392,4 +1398,142 @@ Return ONLY this JSON:
   "answers": ${JSON.stringify(answers)},
   "compiledSummary": "You're building..."
 }`;
+}
+
+export function getColorPaletteFromSeed(seed: string): { primary: string; secondary: string; accent: string } {
+  const palettes = [
+    { primary: '#4f46e5', secondary: '#eef2ff', accent: '#06b6d4' },
+    { primary: '#2563eb', secondary: '#eff6ff', accent: '#f97316' },
+    { primary: '#059669', secondary: '#ecfdf5', accent: '#7c3aed' },
+    { primary: '#e11d48', secondary: '#fff1f2', accent: '#f59e0b' },
+    { primary: '#0d9488', secondary: '#f0fdfa', accent: '#84cc16' },
+  ];
+
+  let hash = 0;
+  for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
+  return palettes[hash % palettes.length];
+}
+
+const TECH_STACK_RULES = `
+TECH STACK:
+  Backend:  Node.js + Express + TypeScript + MongoDB (Mongoose) + Zod + bcrypt
+  Frontend: Next.js 14 Pages Router + React 18 + TypeScript + Tailwind CSS + axios
+  NOTE: Pages Router = pages/ directory. NO "use client". NO app/ directory.
+
+API RESPONSE FORMAT (every endpoint): { success: boolean, data: T | null, error: string | null }
+
+VISUAL STANDARDS (Tailwind):
+  Dashboard: sticky Navbar, stats cards grid, recent items table.
+  List pages: search + "+ New" button, data table, status badges, edit/delete.
+  Form pages: back arrow, labeled inputs h-11, save + cancel buttons.
+  Inputs: border-2 border-gray-200 focus:border-indigo-500 h-11.
+  Buttons: primary=bg-indigo-600 hover:bg-indigo-700.
+  All: responsive, loading spinner, error alerts, transitions.
+
+PREMIUM QUALITY (MANDATORY): Component designs must be hyper-premium, using sophisticated layouts.
+USE EXACT VISUAL TOKENS IN frontend/styles/globals.css: --primary, --secondary, --accent, --background, --surface, --text, --muted.
+`;
+
+export function buildPlannerPrompt(userDescription: string, requirements?: RequirementsDocument | null): string {
+  const req = requirements ? `
+Requirements summary:
+- appType: ${requirements.appType}
+- targetUsers: ${requirements.targetUsers}
+- themeMode: ${requirements.themeMode}
+- coreFeatures: ${(requirements.coreFeatures || []).join(', ')}
+` : '';
+
+  return `You are a senior software architect.
+Create a generation plan for a full-stack web app.
+
+User idea:
+"${userDescription}"
+${req}
+Return ONLY valid JSON with this shape:
+{
+  "projectName": "string",
+  "appType": "string",
+  "modules": [
+    {
+      "name": "kebab-case-module",
+      "label": "Human Label",
+      "fields": ["fieldOne", "fieldTwo", "fieldThree"]
+    }
+  ]
+}
+
+Rules:
+- Infer 2-6 domain modules.
+- Use domain-specific field names.
+- Do not return markdown.`;
+}
+
+export function buildModulePrompt(
+  module: { name: string; label?: string; fields?: string[] },
+  plan: any,
+  seed: string
+): string {
+  const palette = getColorPaletteFromSeed(seed);
+  return `Generate files for ONE module in a full-stack app.
+
+${TECH_STACK_RULES}
+
+Project: ${plan?.projectName || 'my-app'}
+Module: ${module.name}
+Label: ${module.label || module.name}
+Fields: ${(module.fields || []).join(', ')}
+Palette: primary=${palette.primary}, secondary=${palette.secondary}, accent=${palette.accent}
+
+Return ONLY valid JSON:
+{
+  "files": [
+    { "path": "backend/src/modules/${module.name}/${module.name}.schema.ts", "content": "...", "language": "typescript" },
+    { "path": "backend/src/modules/${module.name}/${module.name}.model.ts", "content": "...", "language": "typescript" },
+    { "path": "backend/src/modules/${module.name}/${module.name}.service.ts", "content": "...", "language": "typescript" },
+    { "path": "backend/src/modules/${module.name}/${module.name}.controller.ts", "content": "...", "language": "typescript" },
+    { "path": "backend/src/modules/${module.name}/${module.name}.routes.ts", "content": "...", "language": "typescript" },
+    { "path": "frontend/src/services/${module.name}.service.ts", "content": "...", "language": "typescript" },
+    { "path": "frontend/pages/${module.name}/index.tsx", "content": "...", "language": "typescript" },
+    { "path": "frontend/pages/${module.name}/new.tsx", "content": "...", "language": "typescript" },
+    { "path": "frontend/pages/${module.name}/[id]/edit.tsx", "content": "...", "language": "typescript" }
+  ]
+}
+
+Rules:
+- No markdown fences.
+- All files must be fully implemented.
+- Use the correct API response format.
+- Ensure the frontend matches the visual standards.`;
+}
+
+export function buildSharedFilesPrompt(plan: any, seed: string): string {
+  const palette = getColorPaletteFromSeed(seed);
+  const modules = Array.isArray(plan?.modules) ? plan.modules.map((m: any) => m.name) : [];
+  return `Generate shared project files for a full-stack app.
+
+${TECH_STACK_RULES}
+
+Project name: ${plan?.projectName || 'my-app'}
+Modules: ${modules.join(', ') || 'none'}
+Palette: primary=${palette.primary}, secondary=${palette.secondary}, accent=${palette.accent}
+
+Return ONLY valid JSON:
+{
+  "files": [
+    { "path": "backend/src/server.ts", "content": "...", "language": "typescript" },
+    { "path": "backend/src/middleware/auth.ts", "content": "...", "language": "typescript" },
+    { "path": "frontend/pages/_app.tsx", "content": "...", "language": "typescript" },
+    { "path": "frontend/pages/index.tsx", "content": "...", "language": "typescript" },
+    { "path": "frontend/pages/dashboard.tsx", "content": "...", "language": "typescript" },
+    { "path": "frontend/src/components/Navbar.tsx", "content": "...", "language": "typescript" },
+    { "path": "frontend/src/contexts/AuthContext.tsx", "content": "...", "language": "typescript" },
+    { "path": "frontend/styles/globals.css", "content": "...", "language": "css" }
+  ]
+}
+
+Rules:
+- Include route registration for all modules in backend/src/server.ts.
+- Include navigation links for all modules in Navbar.
+- The landing page (index.tsx) must be a premium and cinematic marketing page.
+- No markdown fences.`;
 }

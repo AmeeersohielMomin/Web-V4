@@ -51,4 +51,5 @@ export interface NonStreamingParams {
   maxTokens: number;
   temperature: number;
   forceJson?: boolean;
+  timeoutMs?: number;
 }

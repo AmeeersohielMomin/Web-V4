@@ -1415,6 +1415,27 @@ export function getColorPaletteFromSeed(seed: string): { primary: string; second
 }
 
 const TECH_STACK_RULES = `
+======================================================
+AI GENERATOR MASTER SOP (STANDARD OPERATING PROCEDURE)
+======================================================
+You are strictly trained to generate production-ready React + Node.js projects.
+
+1. DOMAIN ABSTRACTION (THE PLANNER):
+   - You MUST extract 3 to 6 unique business domains from the user's idea.
+   - NEVER create a generic module called "auth", "authentication", or "users". Auth is handled globally.
+
+2. UI & STYLING (TAILWIND STRICT MODE):
+   - HOW TO STYLE: You MUST write Tailwind utility classes directly on every HTML element (e.g., <button className="bg-indigo-600 text-white rounded-lg p-2">).
+   - WHAT NOT TO DO: NEVER write generic custom CSS classes like .btn-primary or .card in globals.css. ONLY CSS Variables are allowed in globals.css.
+   - ICONS & SVGS: NEVER write raw <svg> tags. Always import icons from 'lucide-react'.
+   - NO COMMENTS: Never write code comments. Wasting tokens is forbidden.
+
+3. COMPONENT GENERATION (ANTI-HALLUCINATION TRAP):
+   - EXPECTATION: Every generated file must be 100% self-contained. 
+   - WHAT NOT TO DO: NEVER import or hallucinate external wrapper components like <Layout>, <Container>, <ErrorAlert>, or <LoadingSpinner>. They DO NOT EXIST.
+   - THE FIX: If you need a dashboard layout, a navbar, or a loading spinner, write the raw JSX/Tailwind for it directly INLINE within the specific page component.
+======================================================
+
 TECH STACK:
   Backend:  Node.js + Express + TypeScript + MongoDB (Mongoose) + Zod + bcrypt
   Frontend: Next.js 14 Pages Router + React 18 + TypeScript + Tailwind CSS + axios
@@ -1425,8 +1446,8 @@ API RESPONSE FORMAT (every endpoint): { success: boolean, data: T | null, error:
 VISUAL STANDARDS (Tailwind):
   Dashboard: sticky Navbar, stats cards grid, recent items table.
   List pages: search + "+ New" button, data table, status badges, edit/delete.
-  Form pages: back arrow, labeled inputs h-11, save + cancel buttons.
-  Inputs: border-2 border-gray-200 focus:border-indigo-500 h-11.
+  Form pages: back arrow, labeled inputs h-11, p-3 text-black rounded-lg gap-4, save + cancel buttons.
+  Inputs: border text-black bg-white focus:border-indigo-500 h-11 p-2 rounded-md.
   Buttons: primary=bg-indigo-600 hover:bg-indigo-700.
   All: responsive, loading spinner, error alerts, transitions.
 
@@ -1463,8 +1484,9 @@ Return ONLY valid JSON with this shape:
 }
 
 Rules:
-- Infer 2-6 domain modules.
-- Use domain-specific field names.
+- Infer 2-6 domain-specific modules.
+- NEVER include "auth", "authentication", or "users" in the modules array. Auth logic is completely hardcoded separately.
+- Use robust, business-specific field names.
 - Do not return markdown.`;
 }
 
@@ -1522,11 +1544,19 @@ Return ONLY valid JSON:
   "files": [
     { "path": "backend/src/server.ts", "content": "...", "language": "typescript" },
     { "path": "backend/src/middleware/auth.ts", "content": "...", "language": "typescript" },
+    { "path": "backend/src/modules/auth/auth.schema.ts", "content": "...", "language": "typescript" },
+    { "path": "backend/src/modules/auth/auth.model.ts", "content": "...", "language": "typescript" },
+    { "path": "backend/src/modules/auth/auth.service.ts", "content": "...", "language": "typescript" },
+    { "path": "backend/src/modules/auth/auth.controller.ts", "content": "...", "language": "typescript" },
+    { "path": "backend/src/modules/auth/auth.routes.ts", "content": "...", "language": "typescript" },
     { "path": "frontend/pages/_app.tsx", "content": "...", "language": "typescript" },
     { "path": "frontend/pages/index.tsx", "content": "...", "language": "typescript" },
+    { "path": "frontend/pages/login.tsx", "content": "...", "language": "typescript" },
+    { "path": "frontend/pages/signup.tsx", "content": "...", "language": "typescript" },
     { "path": "frontend/pages/dashboard.tsx", "content": "...", "language": "typescript" },
     { "path": "frontend/src/components/Navbar.tsx", "content": "...", "language": "typescript" },
     { "path": "frontend/src/contexts/AuthContext.tsx", "content": "...", "language": "typescript" },
+    { "path": "frontend/src/services/auth.service.ts", "content": "...", "language": "typescript" },
     { "path": "frontend/styles/globals.css", "content": "...", "language": "css" }
   ]
 }

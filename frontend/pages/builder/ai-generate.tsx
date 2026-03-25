@@ -9,8 +9,7 @@ import VersionHistory from '@/components/VersionHistory';
 import DeviceFrame from '@/components/DeviceFrame';
 import { generateDockerfile, generateDockerCompose, generateGitHubActions, generateTestFile } from '@/lib/exportUtils';
 import type { RequirementsDocument } from '../../types/generation';
-import { PREVIEW_MSG, type PreviewStack } from '../../lib/previewUtils';
-
+import SandpackSandbox from '@/components/builder/SandpackSandbox';
 interface GeneratedFile {
     path: string;
     content: string;
@@ -224,9 +223,6 @@ export default function AIGenerate() {
     const streamBoxRef = useRef<HTMLDivElement>(null);
     const projectFinalizedRef = useRef(false);
     const [viewMode, setViewMode] = useState<'code' | 'preview'>('code');
-    const previewFrameRef = useRef<HTMLIFrameElement | null>(null);
-    const [previewRunnerReady, setPreviewRunnerReady] = useState(false);
-    const [previewStack, setPreviewStack] = useState<PreviewStack>('unknown');
 
     // ─── New feature state ───
     const [chatPanelOpen, setChatPanelOpen] = useState(true);
@@ -902,39 +898,7 @@ export default function AIGenerate() {
         );
     }, [generatedProject, activeFile]);
 
-    useEffect(() => {
-        const handlePreviewRunnerMessage = (event: MessageEvent) => {
-            if (event?.data?.type === PREVIEW_MSG.READY || event?.data?.type === 'PREVIEW_READY') {
-                setPreviewRunnerReady(true);
-            }
-
-            if (event.data?.type === PREVIEW_MSG.STACK_DETECTED) {
-                setPreviewStack(event.data.stack as PreviewStack);
-            }
-        };
-
-        window.addEventListener('message', handlePreviewRunnerMessage);
-        return () => window.removeEventListener('message', handlePreviewRunnerMessage);
-    }, []);
-
-    useEffect(() => {
-        if (!previewRunnerReady || !generatedProject || !previewEntryPath || !previewFrameRef.current?.contentWindow) {
-            return;
-        }
-
-        const entryFile = generatedProject.files.find((f) => f.path === previewEntryPath);
-        if (!entryFile) return;
-
-        previewFrameRef.current.contentWindow.postMessage(
-            {
-                type: 'UPDATE_PREVIEW',
-                code: entryFile.content,
-                filePath: previewEntryPath,
-                files: generatedProject.files.map((f) => ({ path: f.path, content: f.content }))
-            },
-            '*'
-        );
-    }, [previewRunnerReady, generatedProject, previewEntryPath]);
+    // ─── Render file tree recursively ───
 
     // ─── Render file tree recursively ───
     const renderTreeNode = (node: TreeNode, depth: number = 0) => {
@@ -980,7 +944,7 @@ export default function AIGenerate() {
 
     return (
         <ProtectedRoute>
-            <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col">
+            <div className="h-screen max-h-screen bg-slate-50 text-slate-900 flex flex-col overflow-hidden">
                 {user && <Navbar user={user} onLogout={logout} />}
 
             {/* Top Bar */}
@@ -1238,179 +1202,19 @@ export default function AIGenerate() {
                 {/* ─── Code Viewer (Lovable-style split panel) ─── */}
                 {generatedProject && (
                     <div className="flex-1 flex overflow-hidden">
-                        {/* File Explorer */}
-                        <div className="w-60 flex-shrink-0 border-r border-slate-200 flex flex-col bg-white">
-                            {/* File count header */}
-                            <div className="px-3 py-2.5 border-b border-slate-200 flex items-center justify-between">
-                                <div className="flex items-center space-x-2">
-                                    <span className="text-xs font-semibold text-slate-900">Files</span>
-                                    <span className="text-[10px] px-1.5 py-0.5 bg-slate-100 text-slate-700 rounded font-medium">
-                                        {generatedProject.files.length}
-                                    </span>
-                                </div>
-                                <button
-                                    onClick={() => {
-                                        // Expand/collapse all
-                                        if (expandedFolders.size > 0) {
-                                            setExpandedFolders(new Set());
-                                        } else {
-                                            const all = new Set<string>();
-                                            generatedProject.files.forEach(f => {
-                                                const parts = f.path.split('/');
-                                                for (let i = 1; i < parts.length; i++) {
-                                                    all.add(parts.slice(0, i).join('/'));
-                                                }
-                                            });
-                                            setExpandedFolders(all);
-                                        }
-                                    }}
-                                    className="text-[10px] text-slate-500 hover:text-slate-900 transition-colors"
-                                >
-                                    {expandedFolders.size > 0 ? '⊟ Collapse' : '⊞ Expand'}
-                                </button>
-                            </div>
-
-                            {/* Tree */}
-                            <div className="flex-1 overflow-auto py-1">
-                                {fileTree.map(node => renderTreeNode(node))}
-                            </div>
-
-                            {/* Project info footer */}
-                            <div className="border-t border-slate-200 px-3 py-2">
-                                <p className="text-[10px] text-slate-500 truncate">{generatedProject.description?.substring(0, 60)}</p>
-                            </div>
-
-                            {/* Version History */}
-                            {generatedProject.projectId && (
-                                <div className="border-t border-slate-200">
-                                    <div className="px-3 py-2 bg-slate-50">
-                                        <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-600 mb-1">Version History</p>
-                                    </div>
-                                    <div className="max-h-40 overflow-auto">
-                                        <VersionHistory projectId={generatedProject.projectId} />
-                                    </div>
-                                </div>
-                            )}
-                        </div>
 
                         {/* Code Panel */}
-                        <div className="flex-1 flex flex-col min-w-0">
-                            {activeFile ? (
-                                <>
-                                    {/* File header with Toggle */}
-                                    <div className="flex items-center justify-between px-4 py-2 border-b border-slate-200 bg-white flex-shrink-0">
-                                        <div className="flex items-center space-x-4 min-w-0">
-                                            <div className="flex items-center space-x-2 min-w-0">
-                                                <span className="text-sm">{getFileIcon(activeFile)}</span>
-                                                <span className="text-xs font-mono text-slate-600 truncate">{activeFile}</span>
-                                            </div>
-                                            
-                                            {/* Code/Preview Toggle */}
-                                            {activeFile.includes('frontend') && (activeFile.endsWith('.tsx') || activeFile.endsWith('.jsx') || activeFile.endsWith('.html')) && (
-                                                <div className="flex items-center bg-slate-100 rounded-lg p-0.5 border border-slate-200 mx-2">
-                                                    <button
-                                                        onClick={() => setViewMode('code')}
-                                                        className={`px-3 py-1 text-[10px] rounded-md transition-all ${viewMode === 'code' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'}`}
-                                                    >
-                                                        Code
-                                                    </button>
-                                                    <button
-                                                        onClick={() => setViewMode('preview')}
-                                                        className={`px-3 py-1 text-[10px] rounded-md transition-all ${viewMode === 'preview' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-900'}`}
-                                                    >
-                                                        Preview
-                                                    </button>
-                                                </div>
-                                            )}
-                                        </div>
-                                        
-                                        <div className="flex items-center space-x-2 flex-shrink-0">
-                                            <span className="text-[10px] text-slate-500">{activeFileContent.split('\n').length} lines</span>
-                                            <button
-                                                onClick={() => copyToClipboard(activeFileContent)}
-                                                className="text-[10px] px-2 py-0.5 text-slate-600 hover:text-slate-900 border border-slate-300 rounded transition-all"
-                                            >
-                                                📋 Copy
-                                            </button>
-                                        </div>
-                                    </div>
-
-                                    {/* Content (Code or Preview) */}
-                                    <div className="flex-1 overflow-hidden bg-white relative">
-                                        {/* Code View */}
-                                        <div className={`h-full overflow-auto ${viewMode === 'code' ? 'block' : 'hidden'}`}>
-                                            <pre className="p-4 text-xs font-mono leading-relaxed">
-                                                {activeFileContent.split('\n').map((line, i) => (
-                                                    <div key={i} className="flex hover:bg-slate-50">
-                                                        <span className="inline-block w-10 text-right pr-4 text-slate-400 select-none flex-shrink-0">{i + 1}</span>
-                                                        <code className="text-slate-800 flex-1 whitespace-pre-wrap break-all">{line || ' '}</code>
-                                                    </div>
-                                                ))}
-                                            </pre>
-                                        </div>
-
-                                        {/* Preview View (Pre-warmed) */}
-                                        <div className={`h-full w-full bg-white relative ${viewMode === 'preview' ? 'block' : 'absolute inset-0 pointer-events-none opacity-0'}`}>
-                                            {previewEntryPath ? (
-                                                <div className="h-full w-full flex flex-col">
-                                                    <div className="border-b border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-700 flex items-center justify-between">
-                                                        <div className="truncate">
-                                                            <span className="font-semibold">Preview Diagnostics</span>
-                                                            <span className="mx-2 text-slate-400">|</span>
-                                                            <span>Entry: <span className="font-mono">{previewEntryPath}</span></span>
-                                                        </div>
-                                                        <div className="flex items-center gap-2 text-[10px]">
-                                                            <span className="rounded bg-emerald-50 px-2 py-0.5 text-emerald-700 border border-emerald-200">
-                                                                mapped {generatedProject.files.filter((f) => f.path.startsWith('frontend/')).length}
-                                                            </span>
-                                                            {previewStack !== 'unknown' && (
-                                                                <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                                                                    previewStack === 'vue'        ? 'bg-green-100 text-green-700' :
-                                                                    previewStack === 'nextjs'     ? 'bg-black text-white' :
-                                                                    previewStack === 'react-vite' ? 'bg-blue-100 text-blue-700' :
-                                                                    previewStack === 'html'       ? 'bg-orange-100 text-orange-700' :
-                                                                    'bg-gray-100 text-gray-600'
-                                                                }`}>
-                                                                    {previewStack === 'vue'        && '⬡ Vue 3'}
-                                                                    {previewStack === 'nextjs'     && '▲ Next.js'}
-                                                                    {previewStack === 'react-vite' && '⚡ React+Vite'}
-                                                                    {previewStack === 'html'       && '◇ HTML'}
-                                                                </span>
-                                                            )}
-                                                            <span className="rounded bg-amber-50 px-2 py-0.5 text-amber-700 border border-amber-200">
-                                                                local runner
-                                                            </span>
-                                                        </div>
-                                                    </div>
-                                                    <div className="flex-1 overflow-hidden">
-                                                        <iframe
-                                                            ref={previewFrameRef}
-                                                            src="/builder/preview-runner"
-                                                            className="h-full w-full border-0"
-                                                            sandbox="allow-scripts allow-same-origin allow-forms"
-                                                            onLoad={() => setPreviewRunnerReady(false)}
-                                                            title="Local Preview Runner"
-                                                        />
-                                                    </div>
-                                                </div>
-                                            ) : (
-                                                <div className="h-full w-full flex items-center justify-center text-slate-500 text-sm">
-                                                    No previewable frontend entry found in generated files.
-                                                </div>
-                                            )}
-                                            {viewMode === 'preview' && !activeFileContent && !previewEntryPath && (
-                                                <div className="absolute inset-0 flex items-center justify-center text-slate-500 text-sm bg-white/80">
-                                                    Preparing preview...
-                                                </div>
-                                            )}
-                                        </div>
-                                    </div>
-                                </>
+                        <div className="flex-1 flex flex-col min-w-0 bg-[#151515]">
+                            {generatedProject.files.length > 0 ? (
+                                <SandpackSandbox 
+                                    files={generatedProject.files}
+                                    activeFile={activeFile || undefined}
+                                />
                             ) : (
-                                <div className="flex-1 flex items-center justify-center text-slate-500">
+                                <div className="flex-1 flex items-center justify-center text-slate-500 bg-white">
                                     <div className="text-center">
                                         <div className="text-4xl mb-3">📂</div>
-                                        <p className="text-sm">Select a file from the explorer</p>
+                                        <p className="text-sm">No files generated yet</p>
                                     </div>
                                 </div>
                             )}
@@ -1429,6 +1233,15 @@ export default function AIGenerate() {
                                     </div>
                                     <button onClick={() => setChatPanelOpen(false)} className="text-slate-400 hover:text-slate-700 text-xs">✕</button>
                                 </div>
+
+                                {/* Version History */}
+                                {generatedProject.projectId && (
+                                    <div className="border-b border-slate-200 shadow-[0_2px_10px_rgba(0,0,0,0.03)] z-10 bg-slate-50">
+                                        <div className="max-h-[140px] overflow-auto px-2 py-1">
+                                            <VersionHistory projectId={generatedProject.projectId} />
+                                        </div>
+                                    </div>
+                                )}
 
                                 {/* Chat messages */}
                                 <div className="flex-1 overflow-auto p-3 space-y-3">

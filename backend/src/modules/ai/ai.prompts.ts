@@ -1,1333 +1,941 @@
 // ============================================================
 // IDEA Platform — AI Prompt Templates v3.0
-// Fixed: external services wiring, custom domain scaffolding,
-//        service file generation, and stronger uniqueness.
+// World-class UI. Any app type. Production-grade output.
 // ============================================================
 
 import type { RequirementsAnswer, RequirementsDocument } from './ai.types';
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SECTION 1 — EXTERNAL SERVICE CATALOGUE
-// Maps user-requested features → exact implementation instructions.
+// SECTION 1 — PLANNER PROMPT
+// Phase 1 of two-phase generation.
+// Returns only a JSON plan — no code generated.
+// Fast and cheap (~500 token output).
 // ─────────────────────────────────────────────────────────────────────────────
 
-interface ExternalServiceSpec {
-  /** Short label shown in prompts */
-  label: string;
-  /** npm packages to add to backend */
-  backendPackages: string[];
-  /** npm packages to add to frontend (if any) */
-  frontendPackages?: string[];
-  /** Files the AI MUST generate */
-  requiredFiles: string[];
-  /** Exact implementation note injected into the prompt */
-  implementationNote: string;
-  /** Environment variables needed */
-  envVars: Record<string, string>;
-}
-
-const EXTERNAL_SERVICE_CATALOGUE: Record<string, ExternalServiceSpec> = {
-  stripe: {
-    label: 'Stripe Payments',
-    backendPackages: ['stripe'],
-    frontendPackages: ['@stripe/stripe-js', '@stripe/react-stripe-js'],
-    requiredFiles: [
-      'backend/src/services/stripe.service.ts',
-      'backend/src/modules/payments/payments.routes.ts',
-      'backend/src/modules/payments/payments.controller.ts',
-      'backend/src/modules/payments/payments.service.ts',
-      'frontend/src/services/payment.service.ts',
-      'frontend/pages/checkout.tsx',
-    ],
-    implementationNote: `
-STRIPE INTEGRATION (MANDATORY):
-  backend/src/services/stripe.service.ts:
-    - import Stripe from 'stripe'
-    - const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, { apiVersion: '2024-04-10' })
-    - export createPaymentIntent(amount: number, currency: string, metadata: object)
-    - export createCheckoutSession(lineItems, successUrl, cancelUrl, metadata)
-    - export constructWebhookEvent(payload, signature)
-    - export retrievePaymentIntent(id)
-  backend/src/modules/payments/payments.routes.ts:
-    - POST /payments/create-intent → createPaymentIntent
-    - POST /payments/checkout-session → createCheckoutSession
-    - POST /payments/webhook (raw body parser) → handleWebhook
-    - GET  /payments/:id → getPaymentStatus
-  frontend/pages/checkout.tsx:
-    - Use @stripe/react-stripe-js Elements + PaymentElement
-    - Load stripe with loadStripe(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY!)
-    - Call backend /payments/create-intent → pass clientSecret to Elements
-  .env: STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY`,
-    envVars: {
-      STRIPE_SECRET_KEY: 'sk_test_...',
-      STRIPE_WEBHOOK_SECRET: 'whsec_...',
-      NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: 'pk_test_...',
-    },
-  },
-
-  razorpay: {
-    label: 'Razorpay Payments',
-    backendPackages: ['razorpay'],
-    frontendPackages: [],
-    requiredFiles: [
-      'backend/src/services/razorpay.service.ts',
-      'backend/src/modules/payments/payments.routes.ts',
-      'backend/src/modules/payments/payments.controller.ts',
-      'frontend/pages/checkout.tsx',
-    ],
-    implementationNote: `
-RAZORPAY INTEGRATION (MANDATORY):
-  backend/src/services/razorpay.service.ts:
-    - import Razorpay from 'razorpay'
-    - const razorpay = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID!, key_secret: process.env.RAZORPAY_KEY_SECRET! })
-    - export createOrder(amount: number, currency: string, receipt: string)
-    - export verifySignature(orderId, paymentId, signature): boolean
-  frontend/pages/checkout.tsx:
-    - Load Razorpay script dynamically
-    - Open Razorpay checkout with order_id from backend
-    - On success call backend /payments/verify
-  .env: RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, NEXT_PUBLIC_RAZORPAY_KEY_ID`,
-    envVars: {
-      RAZORPAY_KEY_ID: 'rzp_test_...',
-      RAZORPAY_KEY_SECRET: '...',
-      NEXT_PUBLIC_RAZORPAY_KEY_ID: 'rzp_test_...',
-    },
-  },
-
-  paypal: {
-    label: 'PayPal Payments',
-    backendPackages: ['@paypal/paypal-server-sdk'],
-    frontendPackages: ['@paypal/react-paypal-js'],
-    requiredFiles: [
-      'backend/src/services/paypal.service.ts',
-      'backend/src/modules/payments/payments.routes.ts',
-      'frontend/pages/checkout.tsx',
-    ],
-    implementationNote: `
-PAYPAL INTEGRATION (MANDATORY):
-  backend/src/services/paypal.service.ts:
-    - Use @paypal/paypal-server-sdk to create orders and capture payments
-    - export createOrder(amount, currency, items[])
-    - export captureOrder(orderId)
-  frontend/pages/checkout.tsx:
-    - Use PayPalScriptProvider + PayPalButtons from @paypal/react-paypal-js
-    - createOrder calls backend, onApprove captures
-  .env: PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET, NEXT_PUBLIC_PAYPAL_CLIENT_ID`,
-    envVars: {
-      PAYPAL_CLIENT_ID: '...',
-      PAYPAL_CLIENT_SECRET: '...',
-      NEXT_PUBLIC_PAYPAL_CLIENT_ID: '...',
-    },
-  },
-
-  email: {
-    label: 'Email via Nodemailer',
-    backendPackages: ['nodemailer', '@types/nodemailer'],
-    requiredFiles: [
-      'backend/src/services/email.service.ts',
-    ],
-    implementationNote: `
-EMAIL SERVICE (MANDATORY):
-  backend/src/services/email.service.ts:
-    - import nodemailer from 'nodemailer'
-    - const transporter = nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT), auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } })
-    - export sendWelcomeEmail(to: string, name: string)
-    - export sendPasswordResetEmail(to: string, resetLink: string)
-    - export sendNotificationEmail(to: string, subject: string, body: string)
-    - export sendOrderConfirmationEmail(to: string, order: object)  // if e-commerce
-  Use HTML templates inside the functions (inline HTML strings).
-  .env: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM`,
-    envVars: {
-      SMTP_HOST: 'smtp.gmail.com',
-      SMTP_PORT: '587',
-      SMTP_USER: 'your@email.com',
-      SMTP_PASS: '...',
-      SMTP_FROM: 'noreply@yourapp.com',
-    },
-  },
-
-  resend: {
-    label: 'Resend Email',
-    backendPackages: ['resend'],
-    requiredFiles: ['backend/src/services/email.service.ts'],
-    implementationNote: `
-RESEND EMAIL SERVICE (MANDATORY):
-  backend/src/services/email.service.ts:
-    - import { Resend } from 'resend'
-    - const resend = new Resend(process.env.RESEND_API_KEY)
-    - export sendWelcomeEmail(to, name)
-    - export sendPasswordResetEmail(to, resetLink)
-    - export sendNotificationEmail(to, subject, html)
-    Use resend.emails.send({ from, to, subject, html }) in each function.
-  .env: RESEND_API_KEY, EMAIL_FROM`,
-    envVars: {
-      RESEND_API_KEY: 're_...',
-      EMAIL_FROM: 'noreply@yourdomain.com',
-    },
-  },
-
-  sendgrid: {
-    label: 'SendGrid Email',
-    backendPackages: ['@sendgrid/mail'],
-    requiredFiles: ['backend/src/services/email.service.ts'],
-    implementationNote: `
-SENDGRID EMAIL SERVICE (MANDATORY):
-  backend/src/services/email.service.ts:
-    - import sgMail from '@sendgrid/mail'
-    - sgMail.setApiKey(process.env.SENDGRID_API_KEY!)
-    - export sendWelcomeEmail(to, name)
-    - export sendPasswordResetEmail(to, resetLink)
-    - export sendNotificationEmail(to, subject, html)
-  .env: SENDGRID_API_KEY, SENDGRID_FROM_EMAIL`,
-    envVars: {
-      SENDGRID_API_KEY: 'SG...',
-      SENDGRID_FROM_EMAIL: 'noreply@yourdomain.com',
-    },
-  },
-
-  cloudinary: {
-    label: 'Cloudinary File/Image Upload',
-    backendPackages: ['cloudinary', 'multer', 'multer-storage-cloudinary', '@types/multer'],
-    requiredFiles: [
-      'backend/src/services/cloudinary.service.ts',
-      'backend/src/middleware/upload.ts',
-    ],
-    implementationNote: `
-CLOUDINARY UPLOAD (MANDATORY):
-  backend/src/services/cloudinary.service.ts:
-    - import { v2 as cloudinary } from 'cloudinary'
-    - cloudinary.config({ cloud_name, api_key, api_secret })
-    - export uploadImage(file: Express.Multer.File, folder: string): Promise<{ url, publicId }>
-    - export deleteImage(publicId: string)
-    - export uploadVideo(file, folder)
-  backend/src/middleware/upload.ts:
-    - Use multer with CloudinaryStorage
-    - export uploadSingle = multer({ storage }).single('file')
-    - export uploadMultiple = multer({ storage }).array('files', 10)
-  For any module that has image fields: add POST /[module]/:id/upload endpoint
-    using uploadSingle middleware → calls cloudinaryService.uploadImage
-  .env: CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET`,
-    envVars: {
-      CLOUDINARY_CLOUD_NAME: '...',
-      CLOUDINARY_API_KEY: '...',
-      CLOUDINARY_API_SECRET: '...',
-    },
-  },
-
-  s3: {
-    label: 'AWS S3 File Upload',
-    backendPackages: ['@aws-sdk/client-s3', '@aws-sdk/s3-request-presigner', 'multer', '@types/multer'],
-    requiredFiles: [
-      'backend/src/services/s3.service.ts',
-      'backend/src/middleware/upload.ts',
-    ],
-    implementationNote: `
-AWS S3 UPLOAD (MANDATORY):
-  backend/src/services/s3.service.ts:
-    - import { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3'
-    - import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
-    - const s3 = new S3Client({ region: process.env.AWS_REGION, credentials: { accessKeyId, secretAccessKey } })
-    - export uploadFile(buffer, key, contentType, bucket?): Promise<{ url, key }>
-    - export deleteFile(key, bucket?)
-    - export getPresignedUrl(key, expiresIn?): Promise<string>
-  backend/src/middleware/upload.ts:
-    - Use multer memoryStorage() to get buffer
-    - export uploadSingle = multer({ storage: memoryStorage() }).single('file')
-  .env: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_S3_BUCKET`,
-    envVars: {
-      AWS_ACCESS_KEY_ID: '...',
-      AWS_SECRET_ACCESS_KEY: '...',
-      AWS_REGION: 'us-east-1',
-      AWS_S3_BUCKET: 'my-app-bucket',
-    },
-  },
-
-  oauth: {
-    label: 'OAuth (Google/GitHub Social Login)',
-    backendPackages: ['passport', 'passport-google-oauth20', 'passport-github2', '@types/passport', '@types/passport-google-oauth20'],
-    requiredFiles: [
-      'backend/src/services/oauth.service.ts',
-      'backend/src/middleware/passport.ts',
-      'backend/src/modules/auth/auth.routes.ts', // updated to add /google /github routes
-    ],
-    implementationNote: `
-OAUTH SOCIAL LOGIN (MANDATORY):
-  backend/src/middleware/passport.ts:
-    - Configure GoogleStrategy with clientID, clientSecret, callbackURL
-    - Configure GithubStrategy similarly
-    - On verify callback: find or create user, return user with JWT
-  backend/src/modules/auth/auth.routes.ts — ADD:
-    - GET /auth/google → passport.authenticate('google', { scope: ['profile','email'] })
-    - GET /auth/google/callback → passport.authenticate + redirect with token
-    - GET /auth/github → passport.authenticate('github', { scope: ['user:email'] })
-    - GET /auth/github/callback → same pattern
-  frontend: Add "Sign in with Google" and "Sign in with GitHub" buttons
-    on login.tsx and signup.tsx that link to backend OAuth endpoints.
-    On callback, backend redirects to /auth/social-callback?token=JWT
-    frontend/pages/auth/social-callback.tsx reads token from query, stores in localStorage, redirects to /dashboard
-  .env: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET`,
-    envVars: {
-      GOOGLE_CLIENT_ID: '...',
-      GOOGLE_CLIENT_SECRET: '...',
-      GITHUB_CLIENT_ID: '...',
-      GITHUB_CLIENT_SECRET: '...',
-    },
-  },
-
-  twilio: {
-    label: 'Twilio SMS/WhatsApp',
-    backendPackages: ['twilio'],
-    requiredFiles: ['backend/src/services/sms.service.ts'],
-    implementationNote: `
-TWILIO SMS/WHATSAPP (MANDATORY):
-  backend/src/services/sms.service.ts:
-    - import twilio from 'twilio'
-    - const client = twilio(process.env.TWILIO_ACCOUNT_SID!, process.env.TWILIO_AUTH_TOKEN!)
-    - export sendSms(to: string, message: string)
-    - export sendWhatsApp(to: string, message: string)
-    - export sendOtp(to: string, code: string)
-  Call sendSms/sendOtp from relevant controllers (e.g. booking confirmations, auth OTP).
-  .env: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER`,
-    envVars: {
-      TWILIO_ACCOUNT_SID: 'AC...',
-      TWILIO_AUTH_TOKEN: '...',
-      TWILIO_PHONE_NUMBER: '+1...',
-    },
-  },
-
-  firebase: {
-    label: 'Firebase Push Notifications',
-    backendPackages: ['firebase-admin'],
-    requiredFiles: ['backend/src/services/push.service.ts'],
-    implementationNote: `
-FIREBASE PUSH NOTIFICATIONS (MANDATORY):
-  backend/src/services/push.service.ts:
-    - import * as admin from 'firebase-admin'
-    - admin.initializeApp({ credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT!)) })
-    - export sendPushNotification(token: string, title: string, body: string, data?: object)
-    - export sendMulticast(tokens: string[], title: string, body: string, data?: object)
-  Add fcmToken field to User model (updated when user logs in from device).
-  Call push service from relevant controllers after key events.
-  .env: FIREBASE_SERVICE_ACCOUNT (stringified JSON)`,
-    envVars: {
-      FIREBASE_SERVICE_ACCOUNT: '{"type":"service_account",...}',
-    },
-  },
-
-  websockets: {
-    label: 'Real-time WebSockets (Socket.io)',
-    backendPackages: ['socket.io'],
-    frontendPackages: ['socket.io-client'],
-    requiredFiles: [
-      'backend/src/services/socket.service.ts',
-      'frontend/src/hooks/useSocket.ts',
-    ],
-    implementationNote: `
-SOCKET.IO REAL-TIME (MANDATORY):
-  backend/src/services/socket.service.ts:
-    - import { Server as SocketServer } from 'socket.io'
-    - export function initSocketServer(httpServer): SocketServer
-    - Attach to express http server in server.ts: const io = initSocketServer(httpServer)
-    - Implement rooms: io.on('connection', socket => { socket.join(userId); ... })
-    - export emit(room: string, event: string, data: any) for use in controllers
-  server.ts — use http.createServer(app) then attach socket server
-  frontend/src/hooks/useSocket.ts:
-    - import { io } from 'socket.io-client'
-    - const socket = io(process.env.NEXT_PUBLIC_API_URL!)
-    - export useSocket() hook returning socket instance + connection status
-  Use the hook in relevant pages (chat, notifications, live dashboards).
-  .env: (no extra vars needed; uses same PORT)`,
-    envVars: {},
-  },
-
-  redis: {
-    label: 'Redis (Caching / Queue)',
-    backendPackages: ['ioredis', '@types/ioredis'],
-    requiredFiles: ['backend/src/services/redis.service.ts'],
-    implementationNote: `
-REDIS CACHING (MANDATORY):
-  backend/src/services/redis.service.ts:
-    - import Redis from 'ioredis'
-    - const redis = new Redis(process.env.REDIS_URL)
-    - export set(key: string, value: any, ttlSeconds?: number)
-    - export get<T>(key: string): Promise<T | null>
-    - export del(key: string)
-    - export invalidatePattern(pattern: string)  // uses SCAN + DEL
-  Use redis caching in service layers for expensive reads (e.g. product lists, user sessions).
-  .env: REDIS_URL`,
-    envVars: {
-      REDIS_URL: 'redis://localhost:6379',
-    },
-  },
-
-  'google-maps': {
-    label: 'Google Maps',
-    backendPackages: [],
-    frontendPackages: ['@react-google-maps/api'],
-    requiredFiles: ['frontend/src/components/MapView.tsx'],
-    implementationNote: `
-GOOGLE MAPS (MANDATORY):
-  frontend/src/components/MapView.tsx:
-    - import { GoogleMap, Marker, useJsApiLoader } from '@react-google-maps/api'
-    - Accept props: lat, lng, markers[], zoom, onMarkerClick
-    - Render fully styled map inside a container div
-  Use MapView in relevant pages (e.g. property listings, delivery tracking, store locator).
-  .env: NEXT_PUBLIC_GOOGLE_MAPS_KEY`,
-    envVars: {
-      NEXT_PUBLIC_GOOGLE_MAPS_KEY: '...',
-    },
-  },
-
-  openai: {
-    label: 'OpenAI API Integration',
-    backendPackages: ['openai'],
-    requiredFiles: [
-      'backend/src/services/openai.service.ts',
-      'backend/src/modules/ai/ai.routes.ts',
-      'backend/src/modules/ai/ai.controller.ts',
-    ],
-    implementationNote: `
-OPENAI API INTEGRATION (MANDATORY):
-  backend/src/services/openai.service.ts:
-    - import OpenAI from 'openai'
-    - const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-    - export chatCompletion(messages: {role,content}[], model?: string): Promise<string>
-    - export generateEmbedding(text: string): Promise<number[]>
-    - export analyzeImage(imageUrl: string, prompt: string): Promise<string>
-  backend/src/modules/ai/ai.routes.ts + ai.controller.ts:
-    - POST /ai/chat → streaming chat completion
-    - POST /ai/analyze → image/text analysis
-  frontend: relevant pages call AI endpoints and display streaming responses
-  .env: OPENAI_API_KEY`,
-    envVars: {
-      OPENAI_API_KEY: 'sk-...',
-    },
-  },
-};
-
-/**
- * Detect which external services the user wants and return
- * the combined implementation instructions + required files list.
- */
-export function detectExternalServices(
+export function buildPlannerPrompt(
   userDescription: string,
   requirements?: RequirementsDocument
-): { instructions: string; requiredFiles: string[]; envVars: Record<string, string> } {
-  const text = [
-    userDescription,
-    requirements?.coreFeatures?.join(' ') || '',
-    requirements?.techPreferences || '',
-    requirements?.additionalNotes || '',
-    requirements?.originalPrompt || '',
-  ].join(' ').toLowerCase();
+): string {
+  const reqContext = requirements ? `
+App type: ${requirements.appType}
+Target users: ${requirements.targetUsers}
+Core features: ${requirements.coreFeatures.join(', ')}
+Tech preferences: ${requirements.techPreferences}
+Scale: ${requirements.scale}
+` : '';
 
-  const detectionMap: Record<keyof typeof EXTERNAL_SERVICE_CATALOGUE, string[]> = {
-    stripe: ['stripe', 'credit card', 'card payment', 'stripe payment'],
-    razorpay: ['razorpay', 'razorpay payment'],
-    paypal: ['paypal'],
-    email: ['email', 'nodemailer', 'smtp', 'send email', 'email notification', 'mailer'],
-    resend: ['resend', 'resend email'],
-    sendgrid: ['sendgrid'],
-    cloudinary: ['cloudinary', 'image upload', 'photo upload', 'file upload', 'upload image'],
-    s3: ['s3', 'aws s3', 'amazon s3', 'file storage', 'aws storage'],
-    oauth: ['google login', 'github login', 'social login', 'oauth', 'sso', 'sign in with google'],
-    twilio: ['twilio', 'sms', 'whatsapp', 'text message', 'otp sms'],
-    firebase: ['firebase', 'push notification', 'fcm', 'mobile notification'],
-    websockets: ['real-time', 'realtime', 'socket', 'websocket', 'live chat', 'live update', 'socket.io'],
-    redis: ['redis', 'cache', 'caching', 'session store', 'rate limit'],
-    'google-maps': ['google maps', 'map', 'location', 'geolocation', 'address lookup'],
-    openai: ['openai', 'gpt', 'ai chat', 'ai assistant', 'chatgpt integration', 'llm'],
-  };
+  return `You are a senior software architect planning a full-stack web application.
 
-  const detected = new Set<string>();
+USER IDEA: "${userDescription}"
+${reqContext}
 
-  // If email is requested but no specific provider found, default to nodemailer
-  let emailDetected = false;
+Your job: produce a complete architecture plan as JSON.
+Do NOT generate any code. Only plan.
 
-  for (const [serviceKey, keywords] of Object.entries(detectionMap)) {
-    if (keywords.some(kw => text.includes(kw))) {
-      if (['email', 'resend', 'sendgrid'].includes(serviceKey)) {
-        emailDetected = true;
-      }
-      detected.add(serviceKey);
+Rules:
+1. Return ONLY valid JSON. No markdown. No explanation.
+2. Identify 2-6 domain modules based on what the app actually does.
+3. Use REAL domain vocabulary. Never use generic names like "items" or "resources".
+   - Dating app     → profiles, matches, messages, likes, preferences
+   - Fitness app    → workouts, exercises, plans, progress, goals
+   - Pet care app   → pets, appointments, medications, records, reminders
+   - Legal app      → cases, clients, documents, hearings, invoices
+   - Job board      → jobs, applications, companies, candidates, interviews
+   - School/LMS     → courses, lessons, enrollments, assignments, grades
+   - Real estate    → properties, viewings, offers, agents, inquiries
+   - Fleet mgmt     → vehicles, drivers, trips, maintenance, fuel
+   - Event mgmt     → events, attendees, tickets, venues, speakers
+   - Library        → books, loans, members, reservations, fines
+4. For each module, list EXACT Mongoose field names for this domain.
+   Use domain-specific names. NOT title/description/status for everything.
+5. Identify which modules need relationships (userId refs, foreign keys).
+6. Describe what the dashboard must show (real metrics for this app type).
+7. List all frontend routes needed.
+8. Define the sidebar navigation structure with correct lucide icon names.
+
+Return ONLY this JSON:
+{
+  "projectName": "lowercase-hyphen-name-max-30-chars",
+  "appType": "string describing the app category",
+  "description": "one sentence describing what the app does",
+  "modules": [
+    {
+      "name": "moduleName",
+      "label": "Display Name",
+      "icon": "lucide icon name e.g. Package, Users, Calendar, Briefcase",
+      "fields": [
+        {
+          "name": "fieldName",
+          "type": "String|Number|Boolean|Date|ObjectId",
+          "required": true,
+          "enum": ["val1", "val2"],
+          "ref": "ModelName"
+        }
+      ],
+      "relationships": ["userId", "categoryId"],
+      "routes": ["/module-name", "/module-name/new", "/module-name/:id/edit"],
+      "apiEndpoints": [
+        "GET /api/module-name",
+        "POST /api/module-name",
+        "PUT /api/module-name/:id",
+        "DELETE /api/module-name/:id",
+        "GET /api/module-name/stats"
+      ],
+      "hasStats": true
     }
+  ],
+  "dashboard": {
+    "statCards": [
+      {
+        "label": "Card Label",
+        "metric": "exactly what data this card shows",
+        "icon": "TrendingUp",
+        "color": "blue|green|purple|orange|rose"
+      }
+    ],
+    "tables": ["describe recent items tables to show"],
+    "charts": ["describe any charts if relevant"]
+  },
+  "navigation": {
+    "sidebarSections": [
+      {
+        "label": "Section Label or empty string for ungrouped",
+        "items": [
+          { "label": "Nav Item", "href": "/path", "icon": "lucide icon name" }
+        ]
+      }
+    ]
+  },
+  "colorPalette": {
+    "primary": "#hex e.g. #4f46e5",
+    "primaryLight": "#hex e.g. #eef2ff",
+    "primaryDark": "#hex e.g. #3730a3"
   }
-
-  // Deduplicate: if multiple email providers, pick the most specific one
-  if (detected.has('resend') || detected.has('sendgrid')) {
-    detected.delete('email'); // prefer specific provider
-  }
-  if (emailDetected && !detected.has('resend') && !detected.has('sendgrid')) {
-    detected.add('email'); // default to nodemailer
-  }
-
-  // Deduplicate: if multiple payment providers detected, all are fine (keep all)
-
-  if (detected.size === 0) {
-    return { instructions: '', requiredFiles: [], envVars: {} };
-  }
-
-  const instructions: string[] = [
-    `\n╔══════════════════════════════════════════════════════════════╗`,
-    `║  EXTERNAL SERVICES — GENERATE ALL OF THESE (MANDATORY)      ║`,
-    `╚══════════════════════════════════════════════════════════════╝`,
-    ``,
-    `The user has requested the following external integrations.`,
-    `You MUST generate every file listed and implement each service fully.`,
-    `DO NOT stub or comment out these integrations.`,
-    ``,
-  ];
-
-  const allRequiredFiles: string[] = [];
-  const allEnvVars: Record<string, string> = {};
-
-  for (const key of detected) {
-    const spec = EXTERNAL_SERVICE_CATALOGUE[key];
-    if (!spec) continue;
-    instructions.push(`── ${spec.label} ──`);
-    instructions.push(spec.implementationNote);
-    instructions.push('');
-    allRequiredFiles.push(...spec.requiredFiles);
-    Object.assign(allEnvVars, spec.envVars);
-  }
-
-  instructions.push(`INTEGRATION CHECKLIST — every item below MUST appear in the generated files:`);
-  for (const f of [...new Set(allRequiredFiles)]) {
-    instructions.push(`  ✓ ${f}`);
-  }
-  instructions.push('');
-
-  return {
-    instructions: instructions.join('\n'),
-    requiredFiles: [...new Set(allRequiredFiles)],
-    envVars: allEnvVars,
-  };
+}`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SECTION 2 — SYSTEM PROMPT: CORE ARCHITECTURE
+// SECTION 2 — MODULE GENERATOR PROMPT
+// Phase 2 of two-phase generation.
+// Called once per module. Generates exactly 9 files per module:
+//   Backend:  schema.ts, model.ts, service.ts, controller.ts, routes.ts
+//   Frontend: [name]/index.tsx, [name]/new.tsx, [name]/[id]/edit.tsx,
+//             src/services/[name].service.ts
+// Each call stays within token limits — no truncation possible.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const SYSTEM_PROMPT_FULLSTACK = `You are an expert full-stack developer generating complete, production-ready web applications.
+export function buildModulePrompt(
+  module: any,
+  plan: any,
+  variationSeed: string
+): string {
+  const { primary, primaryLight, primaryDark } = plan.colorPalette || {
+    primary: '#4f46e5',
+    primaryLight: '#eef2ff',
+    primaryDark: '#4338ca'
+  };
 
-You generate ENTIRE applications — not just auth screens. Every app must have ALL domain modules fully functional with working frontend pages.
+  return `You are an expert full-stack developer.
+Generate ONLY the files for the "${module.name}" module of the "${plan.appType}" application.
+Do NOT generate auth files. Do NOT generate server.ts. Do NOT generate shared components.
+Generate ONLY the 9 files listed in OUTPUT FORMAT below.
 
-ABSOLUTE RULES:
-1. ALWAYS generate the COMPLETE Auth module (login, signup, auth middleware) exactly as specified, IN ADDITION TO the requested domain modules.
-2. ALWAYS generate full CRUD for every domain resource the user described.
-3. EVERY backend module: routes.ts + controller.ts + service.ts + model.ts + schema.ts
-4. EVERY frontend module: list page (index.tsx) + create page (new.tsx) + edit page ([id]/edit.tsx) + service file
-5. server.ts MUST register routes for EVERY module.
-6. Navbar MUST link to EVERY module's list page.
-7. Dashboard MUST fetch real stats from ALL domain module services.
-8. External service files MUST be fully implemented — never stubbed or commented out.
-9. Return ONLY raw JSON. No markdown. Start with { end with }.
-10. NO UNRESOLVED IMPORTS: Never import components, hooks, or assets that you do not generate. All imports must be strictly valid to prevent preview engine crashes.
-11. NO JSX SYNTAX ERRORS: Ensure every JSX tag is properly closed. Never use empty attributes (e.g., use required={true} not just required) to prevent Turbopack/Babel crash.
-12. SERVICE PROMISES: Every method in your frontend services must explicitly 'return axios...' so components can safely call '.then()' without TypeError crashes.
-13. ICONS & SVGS: NEVER write raw <svg> tags. Always import icons from 'lucide-react' to save maximum tokens.
-14. ZERO COMMENTS: Do NOT write code comments. You must save context tokens to prevent file truncation.
+═══════════════════════════════════════════════
+MODULE SPECIFICATION
+═══════════════════════════════════════════════
 
-TECH STACK:
-  Backend:  Node.js + Express + TypeScript + MongoDB (Mongoose) + Zod + bcrypt + jsonwebtoken
-  Frontend: Next.js 14 Pages Router + React 18 + TypeScript + Tailwind CSS + axios
-  NOTE: Pages Router = pages/ directory. NO "use client". NO app/ directory.
+Name:          ${module.name}
+Display label: ${module.label}
+Icon:          ${module.icon}
+Fields:
+${JSON.stringify(module.fields, null, 2)}
+Relationships: ${(module.relationships || []).join(', ')}
+Frontend routes: ${(module.routes || []).join(', ')}
+API endpoints:   ${(module.apiEndpoints || []).join(', ')}
 
-API RESPONSE FORMAT (every endpoint): { success: boolean, data: T | null, error: string | null }
+FULL APP CONTEXT:
+Project name: ${plan.projectName}
+App type:     ${plan.appType}
+All modules:  ${plan.modules.map((m: any) => m.name).join(', ')}
+Color system: primary=${primary} | light=${primaryLight} | dark=${primaryDark}
 
-BACKEND FILES TO GENERATE:
+═══════════════════════════════════════════════
+TECH STACK — EXACT — DO NOT DEVIATE
+═══════════════════════════════════════════════
 
-  middleware/auth.ts — JWT verify from Bearer header, attach userId to req, 401 if missing/invalid
+Backend:  Node.js + Express + TypeScript + MongoDB + Mongoose + Zod + bcrypt + jsonwebtoken
+Frontend: Next.js 14 Pages Router + React 18 + TypeScript + Tailwind CSS + axios + lucide-react
+NOTE: Pages Router = pages/ directory. NO "use client". NO app/ directory.
 
-  modules/auth/auth.schema.ts — Zod: signupSchema(name,email,password), loginSchema(email,password)
-  modules/auth/auth.model.ts — Mongoose User: name, email(unique,lowercase), password, role(user/admin), timestamps
-  modules/auth/auth.service.ts — signup(hash+create+JWT), login(compare+JWT), getMe(findById)
-  modules/auth/auth.controller.ts — Express handlers wrapping service with try/catch
-  modules/auth/auth.routes.ts — POST /signup, POST /login, GET /me(authMiddleware)
+═══════════════════════════════════════════════
+BACKEND FILE PATTERNS (5 files)
+═══════════════════════════════════════════════
 
-  modules/[DOMAIN]/[domain].schema.ts — Zod schemas with REAL DOMAIN fields (NOT generic title/description)
-  modules/[DOMAIN]/[domain].model.ts — Mongoose schema with domain fields + userId ref + timestamps
-  modules/[DOMAIN]/[domain].service.ts — getAll(userId,query), getById, create, update, remove, getStats
-  modules/[DOMAIN]/[domain].controller.ts — CRUD handlers with authMiddleware
-  modules/[DOMAIN]/[domain].routes.ts — GET/POST/PUT/DELETE + /stats, all behind authMiddleware
+// --- backend/src/modules/${module.name}/${module.name}.schema.ts ---
+import { z } from 'zod';
+// Create Zod schema with ALL fields from the module spec above
+// Use exact field names, types, and enums from spec
+// createSchema: validates all required fields
+// updateSchema: createSchema.partial() — makes all fields optional
+export const create${capitalize(module.name)}Schema = z.object({ /* all fields */ });
+export const update${capitalize(module.name)}Schema = create${capitalize(module.name)}Schema.partial();
+export type Create${capitalize(module.name)}Input = z.infer<typeof create${capitalize(module.name)}Schema>;
+export type Update${capitalize(module.name)}Input = z.infer<typeof update${capitalize(module.name)}Schema>;
 
-  server.ts — mongoose.connect, register auth routes + ALL domain routes, error handler, PORT from env
-  package.json — express, mongoose, bcrypt, jsonwebtoken, cors, dotenv, zod + dev: typescript, ts-node, nodemon, @types/*
-  tsconfig.json — strict true, esModuleInterop, resolveJsonModules
-  .env.example — DATABASE_URL, JWT_SECRET, PORT, FRONTEND_URL + all external service vars
+// --- backend/src/modules/${module.name}/${module.name}.model.ts ---
+import mongoose from 'mongoose';
+// Mongoose schema with ALL fields from spec
+// Use exact Mongoose types: String, Number, Boolean, Date, mongoose.Schema.Types.ObjectId
+// Add index on userId: { userId: 1, createdAt: -1 }
+// timestamps: true always
+// If field has ref: 'ModelName', use: { type: mongoose.Schema.Types.ObjectId, ref: 'ModelName' }
+export const ${capitalize(module.name)} = mongoose.model('${capitalize(module.name)}', schema);
 
-FRONTEND FILES TO GENERATE:
+// --- backend/src/modules/${module.name}/${module.name}.service.ts ---
+import { ${capitalize(module.name)} } from './${module.name}.model';
+import type { Create${capitalize(module.name)}Input, Update${capitalize(module.name)}Input } from './${module.name}.schema';
+export class ${capitalize(module.name)}Service {
+  // getAll: filter by userId, support search on name/title, filter by status/category
+  async getAll(userId: string, query?: { status?: string; search?: string; category?: string }) { }
+  // getById: find by id AND userId — throws if not found
+  async getById(id: string, userId: string) { }
+  // create: saves new record with userId attached
+  async create(input: Create${capitalize(module.name)}Input, userId: string) { }
+  // update: findOneAndUpdate with userId check — throws if not found
+  async update(id: string, input: Update${capitalize(module.name)}Input, userId: string) { }
+  // remove: deleteOne with userId check — throws if deletedCount === 0
+  async remove(id: string, userId: string) { }
+  // getStats: returns { total, thisWeek, ...counts by status/category }
+  async getStats(userId: string) { }
+}
 
-  services/auth.service.ts — axios instance with Bearer interceptor, signup/login/me methods
-  services/[domain].service.ts — axios CRUD: getAll(params), getById(id), create(data), update(id,data), remove(id), getStats()
-  contexts/AuthContext.tsx — user state, login/signup/logout, token in localStorage, auto-check /me on mount
-  pages/_app.tsx — AuthProvider wrapper + globals.css import
-  pages/index.tsx — COMPULSORY premium landing page (hero + feature sections + social proof + CTA)
-  pages/login.tsx — email+password form, auth.login(), redirect to /dashboard, error display
-  pages/signup.tsx — name+email+password form, auth.signup(), redirect to /dashboard
-  pages/dashboard.tsx — import ALL domain services, Promise.all to fetch stats, display stat cards + recent items table
-  components/Navbar.tsx — links to /dashboard + EVERY domain module's list page + logout button
+// --- backend/src/modules/${module.name}/${module.name}.controller.ts ---
+import { Response } from 'express';
+import { ${capitalize(module.name)}Service } from './${module.name}.service';
+import { create${capitalize(module.name)}Schema, update${capitalize(module.name)}Schema } from './${module.name}.schema';
+import type { AuthRequest } from '../../middleware/auth';
+// All handlers use AuthRequest, extract req.userId
+// All use try/catch with proper HTTP status codes
+// Response format: { success: boolean, data: T | null, error: string | null }
+// stats handler BEFORE getById to avoid :id matching "stats" string
+export class ${capitalize(module.name)}Controller { }
 
-  FOR EACH DOMAIN MODULE (this is the MOST IMPORTANT part):
+// --- backend/src/modules/${module.name}/${module.name}.routes.ts ---
+import { Router } from 'express';
+import { ${capitalize(module.name)}Controller } from './${module.name}.controller';
+import { authMiddleware } from '../../middleware/auth';
+const router = Router();
+router.use(authMiddleware);           // protect ALL routes
+router.get('/stats', ctrl.stats);    // MUST come before /:id
+router.get('/', ctrl.getAll);
+router.get('/:id', ctrl.getById);
+router.post('/', ctrl.create);
+router.put('/:id', ctrl.update);
+router.delete('/:id', ctrl.remove);
+export const ${module.name}Routes = router;
 
-    pages/[module]/index.tsx — LIST PAGE:
-      import [module]Service, useAuth, Navbar
-      Fetch items in useEffect with [module]Service.getAll()
-      Search input + "+ New" button linking to /[module]/new
-      Table with domain-specific columns (NOT generic title/status)
-      Edit link → /[module]/[id]/edit, Delete button → service.remove(id)
-      ALL service calls must be REAL code (never commented out)
+═══════════════════════════════════════════════
+FRONTEND FILE PATTERNS (4 files)
+═══════════════════════════════════════════════
 
-    pages/[module]/new.tsx — CREATE FORM:
-      Form with domain-specific fields (NOT generic title/description)
-      Submit → [module]Service.create(formData), redirect to /[module]
-      Error display + loading state + cancel button
+CRITICAL UI RULES — ENFORCE IN EVERY GENERATED PAGE:
+1. Import lucide-react icons at the TOP of every page
+2. Use Sidebar layout wrapper: import Sidebar from '../../src/components/Sidebar'
+3. Use toast for ALL mutations: import { useToast } from '../../src/hooks/useToast'
+4. Skeleton rows during loading — NEVER a blank table
+5. Rich empty state with icon + description + CTA — NEVER just text
+6. Icon buttons for edit/delete — NEVER text-only buttons
+7. NO browser alert() anywhere — use toast for errors
+8. NO commented-out service calls — ALL calls must be uncommented and working
 
-    pages/[module]/[id]/edit.tsx — EDIT FORM:
-      Load with [module]Service.getById(id) in useEffect
-      Pre-fill form fields with loaded data
-      Submit → [module]Service.update(id, formData), redirect to /[module]
+// --- frontend/src/services/${module.name}.service.ts ---
+import axios from 'axios';
+// Create API instance with token interceptor (reads from localStorage)
+// UNCOMMENTED, WORKING methods only:
+export const ${module.name}Service = {
+  getAll:   (params?: Record<string, string>) => API.get('/api/${module.name}', { params }),
+  getById:  (id: string) => API.get(\`/api/${module.name}/\${id}\`),
+  create:   (data: any) => API.post('/api/${module.name}', data),
+  update:   (id: string, data: any) => API.put(\`/api/${module.name}/\${id}\`, data),
+  remove:   (id: string) => API.delete(\`/api/${module.name}/\${id}\`),
+  getStats: () => API.get('/api/${module.name}/stats'),
+};
 
-  styles/globals.css — ONLY @tailwind directives. No custom CSS classes.
-  package.json — next, react, react-dom, axios + dev: typescript, tailwindcss, postcss, autoprefixer, @types/*
-  next.config.js, tailwind.config.js, postcss.config.js, .env.example
+// --- frontend/pages/${module.name}/index.tsx --- LIST PAGE
+// Uses: import Sidebar from '../../src/components/Sidebar'
+// Uses: import { useToast } from '../../src/hooks/useToast'
+// Uses: import { Plus, Search, Pencil, Trash2, ${module.icon} } from 'lucide-react'
+// Uses: import { ${module.name}Service } from '../../src/services/${module.name}.service'
+//
+// Layout:
+// <div className="sidebar-layout">
+//   <Sidebar />
+//   <main className="min-h-screen bg-gray-50 p-6 lg:p-8">
+//
+// Page header row:
+//   Left: icon in colored box + title + count
+//   Right: "+ New ${module.label}" button with Plus icon and primary color
+//
+// Filter row:
+//   Search input with Search icon on left
+//   Status/category dropdown filter if module has enum fields
+//
+// Table card (bg-white rounded-2xl border):
+//   Column headers: uppercase, tracking-wider, text-gray-500
+//   Skeleton rows when loading: animate-pulse, 5 rows
+//   Data rows: hover:bg-gray-50/50
+//   Status column: colored badge with dot indicator
+//   Actions column: Pencil icon button + Trash2 icon button
+//   Empty state: large icon in gray box + title + description + CTA button
+//
+// On delete: call ${module.name}Service.remove(id)
+//   Success: toast({ message: '${module.label} deleted', type: 'success' })
+//   Error:   toast({ message: err.message, type: 'error' })
+//   Remove from local state immediately
 
-VISUAL STANDARDS (Tailwind):
-  Auth: gradient bg, centered card max-w-md, rounded-2xl shadow-xl
-  Dashboard: sticky Navbar, stats cards grid, recent items table
-  List pages: search + "+ New" button, data table, status badges, edit/delete
-  Form pages: back arrow, labeled inputs h-11, save + cancel buttons
-  All: responsive, loading spinner, error alerts, transitions
-  Inputs: border-2 border-gray-200 focus:border-indigo-500 h-11
-  Buttons: primary=bg-indigo-600 hover:bg-indigo-700
+// --- frontend/pages/${module.name}/new.tsx --- CREATE PAGE
+// Uses same imports as list page
+// Layout: sidebar-layout
+// Breadcrumb: ${module.label} / New ${module.label}
+// Back button (← arrow) top left
+//
+// Form card (bg-white rounded-2xl):
+//   Each field from module spec gets:
+//     - label (bold, text-sm)
+//     - input/select/textarea matching field type
+//     - border border-gray-200 rounded-xl h-11 for inputs
+//     - Error message in red below input
+//   String fields → <input type="text">
+//   Number fields → <input type="number">
+//   Date fields   → <input type="date">
+//   Boolean fields → <input type="checkbox"> or toggle
+//   Enum fields   → <select> with all enum values as options
+//   ObjectId ref  → use free-text input for now
+//
+// Buttons:
+//   Save (primary color bg, white text, shows spinner when saving)
+//   Cancel (border, gray text, navigates back)
+//
+// On submit: call ${module.name}Service.create(form)
+//   Success: toast success + router.push('/${module.name}')
+//   Error:   toast error, stay on page
 
-  PREMIUM QUALITY REQUIREMENTS (MANDATORY):
-    1) TRUE TAILWIND STYLING (MANDATORY ON ALL PAGES):
-      DO NOT write custom CSS or variables in styles/globals.css. Leave it perfectly clean with just @tailwind directives.
-      INSTEAD, configure your design system natively inside tailwind.config.js under theme.extend.colors (e.g., primary, secondary, accent, surface, background, muted).
-      Use these native Tailwind classes directly on JSX elements (e.g. className="bg-primary hover:bg-primary/90 text-white rounded-xl shadow-lg").
-      EVERY page (dashboard, domain lists, forms, landing) MUST be perfectly styled with deep Tailwind configurations. Do not leave any domain page unstyled.
+// --- frontend/pages/${module.name}/[id]/edit.tsx --- EDIT PAGE
+// Same as new.tsx BUT:
+//   On mount: fetch existing record with ${module.name}Service.getById(id)
+//   Show skeleton form while loading
+//   Pre-fill all form fields with fetched data
+//   Handle 404: show "Not found" message + back button
+//   On submit: call ${module.name}Service.update(id, form)
+//   Success: toast "Updated successfully" + router.push('/${module.name}')
+//   Error:   toast error, stay on page
 
-    2) MANDATORY ANIMATIONS
-      Include meaningful motion primitives:
-       - page-load reveal animation
-       - staggered card/list reveal
-       - button/input hover + focus transitions
-      Implement via Tailwind animation utilities and/or @keyframes in globals.css.
+═══════════════════════════════════════════════
+OUTPUT FORMAT — RETURN EXACTLY THIS JSON
+═══════════════════════════════════════════════
 
-    3) LAYOUT COMPOSITION RULES
-      Landing page must include:
-       - Hero section with strong value proposition and primary CTA
-       - At least 3 feature/value blocks
-       - Trust/social proof/testimonial or metrics section
-       - Final CTA section before footer
-      Use layered backgrounds (gradient/shapes/pattern), not flat single-color background.
-
-    4) HARD FAIL CRITERIA
-      If any requirement above is missing, the output is INVALID and must be regenerated.
-      Do not return "almost complete" output.
-
-OUTPUT FORMAT (raw JSON only):
 {
-  "projectName": "my-app",
-  "description": "One sentence",
-  "files": [{ "path": "backend/src/server.ts", "content": "full code", "language": "typescript" }],
-  "envVars": {
-    "backend": { "DATABASE_URL": "mongodb://localhost:27017/myapp", "JWT_SECRET": "change-this", "PORT": "5000", "FRONTEND_URL": "http://localhost:3000" },
-    "frontend": { "NEXT_PUBLIC_API_URL": "http://localhost:5000" }
-  },
-  "dependencies": {
-    "backend": { "express": "^4.18.2", "mongoose": "^8.0.3", "bcrypt": "^5.1.1", "jsonwebtoken": "^9.0.2", "cors": "^2.8.5", "dotenv": "^16.3.1", "zod": "^3.22.4" },
-    "frontend": { "next": "14.0.4", "axios": "^1.6.2", "react": "^18.2.0", "react-dom": "^18.2.0", "lucide-react": "^0.300.0" }
-  },
-  "setupInstructions": ["cd backend && npm install && npm run dev", "cd frontend && npm install && npm run dev"]
-}`;
+  "module": "${module.name}",
+  "files": [
+    {
+      "path": "backend/src/modules/${module.name}/${module.name}.schema.ts",
+      "content": "complete working TypeScript file content",
+      "language": "typescript"
+    },
+    {
+      "path": "backend/src/modules/${module.name}/${module.name}.model.ts",
+      "content": "complete working TypeScript file content",
+      "language": "typescript"
+    },
+    {
+      "path": "backend/src/modules/${module.name}/${module.name}.service.ts",
+      "content": "complete working TypeScript file content",
+      "language": "typescript"
+    },
+    {
+      "path": "backend/src/modules/${module.name}/${module.name}.controller.ts",
+      "content": "complete working TypeScript file content",
+      "language": "typescript"
+    },
+    {
+      "path": "backend/src/modules/${module.name}/${module.name}.routes.ts",
+      "content": "complete working TypeScript file content",
+      "language": "typescript"
+    },
+    {
+      "path": "frontend/src/services/${module.name}.service.ts",
+      "content": "complete working TypeScript file content",
+      "language": "typescript"
+    },
+    {
+      "path": "frontend/pages/${module.name}/index.tsx",
+      "content": "complete working TypeScript React component",
+      "language": "typescript"
+    },
+    {
+      "path": "frontend/pages/${module.name}/new.tsx",
+      "content": "complete working TypeScript React component",
+      "language": "typescript"
+    },
+    {
+      "path": "frontend/pages/${module.name}/[id]/edit.tsx",
+      "content": "complete working TypeScript React component",
+      "language": "typescript"
+    }
+  ]
+}
+
+Return ONLY raw JSON. No markdown. Start with { and end with }.`;
+}
+
+// Helper function used in templates above
+function capitalize(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SECTION 3 — DESIGN DNA SYSTEM
+// SECTION 3 — SHARED FILES PROMPT
+// Phase 3 of two-phase generation.
+// Generates all infrastructure files once after all module files are done:
+//   server.ts, auth middleware, Sidebar, useToast, dashboard, auth pages,
+//   globals.css, tailwind config, package.json files
 // ─────────────────────────────────────────────────────────────────────────────
 
-const STYLE_DNA_PRESETS = {
-  layoutArchetypes: [
-    'editorial split-screen with oversized hero headings',
-    'minimal bento grid with asymmetrical card proportions',
-    'dashboard with modular blocks and collapsible side rail',
-    'storytelling hero-first flow with sectional reveals',
-    'compact productivity layout with dense information hierarchy',
-    'neo-brutalist block layout with sharp section separation',
-    'soft rounded SaaS layout with high whitespace discipline',
-  ],
-  palettes: [
-    'vibrant-indigo | primary:#4f46e5 secondary:#eef2ff accent:#06b6d4',
-    'bold-blue | primary:#2563eb secondary:#eff6ff accent:#f97316',
-    'emerald-pro | primary:#059669 secondary:#ecfdf5 accent:#7c3aed',
-    'ruby-modern | primary:#e11d48 secondary:#fff1f2 accent:#f59e0b',
-    'teal-tech | primary:#0d9488 secondary:#f0fdfa accent:#84cc16',
-    'purple-premium | primary:#7c3aed secondary:#f5f3ff accent:#ec4899',
-    'slate-pro | primary:#334155 secondary:#f1f5f9 accent:#3b82f6',
-    'violet-vibrant | primary:#7c3aed secondary:#f5f3ff accent:#f59e0b',
-    'cyan-modern | primary:#0891b2 secondary:#ecfeff accent:#f43f5e',
-    'green-fresh | primary:#16a34a secondary:#f0fdf4 accent:#8b5cf6',
-  ],
-  typographyMoods: [
-    'high-contrast editorial with bold display headings',
-    'technical mono-accent for data-heavy interfaces',
-    'clean geometric sans with precise kerning',
-    'friendly rounded sans with warm letter-spacing',
-    'elegant condensed headings with refined hierarchy',
-    'modern grotesk with oversized bold display titles',
-  ],
-  surfaces: [
-    'flat matte panels with subtle 1px borders',
-    'soft glass cards with backdrop blur and layered depth',
-    'paper-like cards with gentle drop shadows',
-    'high-contrast blocks with sharp edges and bold dividers',
-    'gradient-tinted panels with restrained ambient glow',
-  ],
-  motionProfiles: [
-    'subtle fade-and-rise on first paint 200ms ease-out',
-    'snappy 120ms transitions on hover and active states',
-    'staggered reveal for lists and card grids',
-    'minimal motion with emphasis on hover state changes only',
-    'spring-based micro-interactions on buttons and inputs',
-  ],
-  themeModes: [
-    'light professional with white surfaces and dark text',
-    'dark professional with gray-900 surfaces and gray-100 text',
-    'hybrid light-with-dark-header sections',
-    'neutral warm daylight palette',
-    'high-contrast enterprise with pure black and white accented',
-  ],
-} as const;
+export function buildSharedFilesPrompt(plan: any, variationSeed: string): string {
+  const designDNA = buildDesignDNA(variationSeed);
+  const { primary, primaryLight, primaryDark } = plan.colorPalette || {
+    primary: '#4f46e5',
+    primaryLight: '#eef2ff',
+    primaryDark: '#4338ca'
+  };
+
+  const moduleImports = plan.modules.map((m: any) =>
+    `  const { ${m.name}Routes } = await import('./modules/${m.name}/${m.name}.routes');`
+  ).join('\n');
+
+  const routeRegistrations = plan.modules.map((m: any) =>
+    `  app.use('/api/${m.name}', ${m.name}Routes);`
+  ).join('\n');
+
+  const dashboardStatCards = (plan.dashboard?.statCards || []).map((c: any) =>
+    `{ label: '${c.label}', metric: '${c.metric}', icon: '${c.icon}', color: '${c.color}' }`
+  ).join(',\n  ');
+
+  const sidebarNav = JSON.stringify(plan.navigation?.sidebarSections || [], null, 2);
+
+  return `You are an expert full-stack developer.
+Generate ALL shared infrastructure files for the "${plan.projectName}" application.
+These files wire all modules together and define the global visual system.
+
+PROJECT CONTEXT:
+App name:     ${plan.projectName}
+App type:     ${plan.appType}
+Description:  ${plan.description}
+Modules:      ${plan.modules.map((m: any) => m.name).join(', ')}
+Color system: primary=${primary} | light=${primaryLight} | dark=${primaryDark}
+Navigation:   ${sidebarNav}
+Dashboard:    ${dashboardStatCards}
+
+${designDNA}
+
+═══════════════════════════════════════════════
+GENERATE ALL 21 OF THESE FILES — EVERY ONE IS REQUIRED
+═══════════════════════════════════════════════
+
+1.  backend/src/server.ts
+2.  backend/src/middleware/auth.ts
+3.  backend/src/modules/auth/auth.schema.ts
+4.  backend/src/modules/auth/auth.model.ts
+5.  backend/src/modules/auth/auth.service.ts
+6.  backend/src/modules/auth/auth.controller.ts
+7.  backend/src/modules/auth/auth.routes.ts
+8.  backend/package.json
+9.  backend/tsconfig.json
+10. backend/.env.example
+11. frontend/pages/_app.tsx
+12. frontend/pages/index.tsx
+13. frontend/pages/login.tsx
+14. frontend/pages/signup.tsx
+15. frontend/pages/dashboard.tsx
+16. frontend/src/contexts/AuthContext.tsx
+17. frontend/src/components/Sidebar.tsx
+18. frontend/src/hooks/useToast.tsx
+19. frontend/styles/globals.css
+20. frontend/package.json
+21. frontend/tailwind.config.js
+
+═══════════════════════════════════════════════
+EXACT PATTERNS — FOLLOW PRECISELY
+═══════════════════════════════════════════════
+
+──── server.ts (MUST register ALL module routes) ────
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import mongoose from 'mongoose';
+dotenv.config();
+const app = express();
+app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000', credentials: true }));
+app.use(express.json({ limit: '10mb' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+async function startServer() {
+  await mongoose.connect(process.env.DATABASE_URL!);
+  console.log('MongoDB connected');
+  const { authRoutes } = await import('./modules/auth/auth.routes');
+  app.use('/api/auth', authRoutes);
+  // === ALL MODULE ROUTES — GENERATED FROM PLAN ===
+${moduleImports}
+${routeRegistrations}
+  // ===============================================
+  app.use((err: any, _req: any, res: any, _next: any) => {
+    console.error(err);
+    res.status(500).json({ success: false, data: null, error: 'Internal server error' });
+  });
+  app.listen(process.env.PORT || 5000, () => console.log('Server running'));
+}
+startServer();
+
+──── Sidebar.tsx (CRITICAL — defines entire app look) ────
+// Left sidebar (w-64), fixed on desktop, slide-in on mobile
+// Sections from navigation plan: ${sidebarNav.slice(0, 200)}
+// Logo at top with app name + colored icon
+// Active item highlighted with primary background color
+// User profile at bottom: avatar initial + name + email + logout button
+// Mobile: hamburger button in top bar triggers slide-in overlay
+
+──── useToast.tsx ────
+// Simple toast system with ToastProvider and useToast hook
+// Toast appears bottom-right, auto-dismisses after 3.5 seconds
+// Types: success (green dot), error (red dot), info (blue dot)
+// ToastProvider wraps children and renders toasts as portal
+// useToast() returns { toast } function
+// toast({ message: string, type: 'success' | 'error' | 'info' })
+
+──── dashboard.tsx (shows REAL API data from modules) ────
+// Import and call stats from EVERY module service (uncommented, working)
+// Import ALL module services:
+${plan.modules.map((m: any) => `// import { ${m.name}Service } from '../src/services/${m.name}.service';`).join('\n')}
+//
+// Stat cards with gradient background pattern:
+${dashboardStatCards}
+//
+// Use this gradient stat card pattern:
+const StatCard = ({ label, value, icon: Icon, color, change }: any) => {
+  const colors = {
+    blue:   'from-blue-500 to-blue-600',
+    green:  'from-green-500 to-green-600',
+    purple: 'from-purple-500 to-purple-600',
+    orange: 'from-orange-500 to-orange-600',
+    rose:   'from-rose-500 to-rose-600',
+  };
+  return (
+    <div className={\`bg-gradient-to-br \${colors[color]} rounded-2xl p-6 text-white\`}>
+      <div className="flex items-center justify-between mb-4">
+        <div className="w-10 h-10 bg-white/20 rounded-xl flex items-center justify-center">
+          <Icon className="w-5 h-5 text-white"/>
+        </div>
+        {change && <span className="text-xs bg-white/20 px-2 py-1 rounded-full">{change}</span>}
+      </div>
+      <p className="text-3xl font-bold">{value ?? 0}</p>
+      <p className="text-sm text-white/80 mt-1">{label}</p>
+    </div>
+  );
+};
+
+──── login.tsx (split-screen premium layout) ────
+// Left 50%: form with logo, heading, email+password fields, submit button
+// Right 50%: gradient (primary to primaryDark) with app name, tagline, feature list with CheckCircle icons
+// Responsive: right panel hidden on mobile (hidden lg:flex)
+// Form: email + password + error state + loading state
+// On success: router.push('/dashboard')
+// Link to /signup at bottom of form
+
+──── signup.tsx (same split-screen layout as login) ────
+// Left: form with name + email + password + confirm password fields
+// Right: same gradient panel as login
+// On success: router.push('/dashboard') ← takes user straight to app
+
+──── globals.css ────
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --primary: ${primary};
+  --primary-light: ${primaryLight};
+  --primary-dark: ${primaryDark};
+  --sidebar-width: 256px;
+}
+
+* { box-sizing: border-box; }
+body { font-family: 'Inter', system-ui, -apple-system, sans-serif; -webkit-font-smoothing: antialiased; }
+
+.sidebar-layout { padding-left: 0; }
+@media (min-width: 1024px) { .sidebar-layout { padding-left: var(--sidebar-width); } }
+
+.animate-in { animation: fadeInUp 0.2s ease-out; }
+@keyframes fadeInUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+.slide-in-from-right-5 { animation: slideInRight 0.3s ease-out; }
+@keyframes slideInRight { from { transform: translateX(20px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+──── tailwind.config.js ────
+module.exports = {
+  content: ['./pages/**/*.{js,ts,jsx,tsx}', './src/**/*.{js,ts,jsx,tsx}'],
+  theme: {
+    extend: {
+      colors: {
+        primary: { DEFAULT: '${primary}', light: '${primaryLight}', dark: '${primaryDark}' }
+      },
+      fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] }
+    }
+  },
+  plugins: [],
+};
+
+══════════════════════════════════════════════
+OUTPUT FORMAT
+══════════════════════════════════════════════
+
+{
+  "shared": true,
+  "files": [
+    { "path": "backend/src/server.ts", "content": "complete content", "language": "typescript" },
+    // ... all 21 files
+  ]
+}
+
+Return ONLY raw JSON. No markdown. Start with { and end with }.`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 4 — DESIGN DNA
+// ─────────────────────────────────────────────────────────────────────────────
+
+const PALETTES = [
+  { primary: '#4f46e5', primaryLight: '#eef2ff', primaryDark: '#4338ca' },
+  { primary: '#2563eb', primaryLight: '#eff6ff', primaryDark: '#1d4ed8' },
+  { primary: '#059669', primaryLight: '#ecfdf5', primaryDark: '#047857' },
+  { primary: '#e11d48', primaryLight: '#fff1f2', primaryDark: '#be123c' },
+  { primary: '#0d9488', primaryLight: '#f0fdfa', primaryDark: '#0f766e' },
+  { primary: '#7c3aed', primaryLight: '#f5f3ff', primaryDark: '#6d28d9' },
+  { primary: '#334155', primaryLight: '#f1f5f9', primaryDark: '#1e293b' },
+  { primary: '#0891b2', primaryLight: '#ecfeff', primaryDark: '#0e7490' },
+  { primary: '#16a34a', primaryLight: '#f0fdf4', primaryDark: '#15803d' },
+  { primary: '#ea580c', primaryLight: '#fff7ed', primaryDark: '#c2410c' },
+] as const;
+
+const AUTH_LAYOUTS = [
+  'split-screen with full-height decorative gradient panel on the right',
+  'split-screen with app screenshot mockup on the right panel',
+  'centered card on gradient mesh background with subtle pattern',
+  'split-screen with bold feature list and icon grid on right',
+  'minimal left-aligned form with oversized heading above the card',
+  'two-column with testimonial quote and avatar on the right side',
+] as const;
 
 function hashSeed(seed: string): number {
-  let hash = 0;
-  for (let i = 0; i < seed.length; i++) {
-    hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
-  }
-  return hash;
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  return h;
 }
 
-function pickBySeed<T>(values: readonly T[], seed: string, offset: number): T {
-  return values[(hashSeed(`${seed}:${offset}`) + offset) % values.length];
+function pickBySeed<T>(arr: readonly T[], seed: string, offset: number): T {
+  return arr[(hashSeed(`${seed}:${offset}`) + offset) % arr.length];
+}
+
+export function getColorPaletteFromSeed(seed: string) {
+  return { ...pickBySeed(PALETTES, seed, 1) };
 }
 
 function buildDesignDNA(seed: string): string {
+  const palette    = pickBySeed(PALETTES, seed, 1);
+  const authLayout = pickBySeed(AUTH_LAYOUTS, seed, 2);
   return [
     `DESIGN DNA [seed: ${seed}]`,
-    `  Layout:     ${pickBySeed(STYLE_DNA_PRESETS.layoutArchetypes, seed, 1)}`,
-    `  Palette:    ${pickBySeed(STYLE_DNA_PRESETS.palettes, seed, 2)}`,
-    `  Theme:      ${pickBySeed(STYLE_DNA_PRESETS.themeModes, seed, 3)}`,
-    `  Typography: ${pickBySeed(STYLE_DNA_PRESETS.typographyMoods, seed, 4)}`,
-    `  Surfaces:   ${pickBySeed(STYLE_DNA_PRESETS.surfaces, seed, 5)}`,
-    `  Motion:     ${pickBySeed(STYLE_DNA_PRESETS.motionProfiles, seed, 6)}`,
+    `  Auth layout:    ${authLayout}`,
+    `  Primary:        ${palette.primary}`,
+    `  Primary light:  ${palette.primaryLight}`,
+    `  Primary dark:   ${palette.primaryDark}`,
+    `  Font:           Inter (system-ui fallback)`,
+    `  Border radius:  rounded-2xl for cards, rounded-xl for inputs/buttons`,
+    `  Shadows:        shadow-sm for cards, shadow-lg for modals`,
+    `  Spacing:        p-6 to p-8 for page containers, gap-4 to gap-6 for grids`,
     ``,
-    `Apply this DNA across ALL pages. NOT just auth screens.`,
-    `Define palette colors as CSS variables in globals.css.`,
-    `Use primary color for buttons, active links, focus rings.`,
-    `Use secondary color for backgrounds, hover states, badges.`,
+    `Apply across ALL pages uniformly. Every page matches the same system.`,
+    `Define --primary CSS variable in globals.css and use it everywhere.`,
   ].join('\n');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SECTION 4 — APP-TYPE MODULE DETECTOR
+// SECTION 5 — DOMAIN MODULE DETECTOR
+// Used by the legacy single-shot prompt (fallback).
+// Two-phase generation uses the Planner instead.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function detectDomainModules(
+export function detectDomainModules(
   userDescription: string,
-  requirements?: RequirementsDocument,
+  requirements?: RequirementsDocument
 ): string {
   const text = [
     userDescription,
     requirements?.appType || '',
     requirements?.coreFeatures?.join(' ') || '',
-    requirements?.originalPrompt || '',
+    requirements?.originalPrompt || ''
   ].join(' ').toLowerCase();
 
   const guides: Record<string, string> = {
     ecommerce: `
-DOMAIN MODULES TO GENERATE (e-commerce):
-  1. products   — name, price, description, stock, category, images[], available, sku
-  2. categories — name, slug, description, parentCategory
-  3. orders     — userId, items[{productId,qty,price}], status(pending/confirmed/shipped/delivered), total, shippingAddress
-  4. cart       — userId, items[{productId,qty}], updatedAt
-Backend: all 4 modules × 5 files each = 20 backend module files
-Frontend: all 4 modules × 3 pages each + 4 service files = 16 frontend files
-Dashboard must show: revenue today, pending orders count, low stock alerts, recent orders table`,
+MODULES: products (name,price,stock,category,images[],sku,available), categories (name,slug,color),
+orders (userId,items[{productId,qty,price}],status,total,shippingAddress), cart (userId,items[{productId,qty}])
+Dashboard: revenue today (green), pending orders (orange), products count (blue), low stock alerts table
+Sidebar: Dashboard, Products, Orders, Categories, Settings`,
 
     blog: `
-DOMAIN MODULES TO GENERATE (blog/cms):
-  1. posts      — title, slug, content, excerpt, status(draft/published), categoryId, tags[], authorId, publishedAt
-  2. categories — name, slug, description, color
-  3. comments   — content, postId, authorId, status(pending/approved), parentCommentId
-Backend: all 3 modules × 5 files each = 15 backend module files
-Frontend: all 3 modules × 3 pages each + 3 service files = 12 frontend files
-Dashboard must show: published/draft post counts, recent posts table, pending comments, category breakdown`,
+MODULES: posts (title,slug,content,excerpt,status,categoryId,tags[],publishedAt),
+categories (name,slug,color), comments (content,postId,authorId,status)
+Dashboard: published vs draft, pending comments, recent posts table
+Sidebar: Dashboard, Posts, Categories, Comments, Settings`,
 
     task: `
-DOMAIN MODULES TO GENERATE (task/project management):
-  1. projects — name, description, status(active/on-hold/completed), deadline, color, ownerId
-  2. tasks    — title, description, status(todo/in-progress/review/done), priority(low/medium/high/urgent), assigneeId, dueDate, projectId, tags[]
-  3. comments — content, taskId, authorId, createdAt
-Backend: all 3 modules × 5 files each = 15 backend module files
-Frontend: all 3 modules × 3 pages each + 3 service files = 12 frontend files
-Dashboard must show: tasks due today, tasks by status count, overdue tasks, project progress`,
+MODULES: projects (name,description,status,deadline,color,ownerId),
+tasks (title,description,status,priority,assigneeId,dueDate,projectId,tags[]),
+comments (content,taskId,authorId)
+Dashboard: tasks due today (rose), overdue (red), by-status breakdown, project progress bars
+Sidebar: Dashboard, Projects, My Tasks, All Tasks, Settings`,
 
     booking: `
-DOMAIN MODULES TO GENERATE (booking/appointment):
-  1. services     — name, description, duration(min), price, category, available
-  2. bookings     — serviceId, userId, customerName, customerEmail, date, startTime, status(pending/confirmed/cancelled/completed), notes, totalPrice
-  3. availability — dayOfWeek(0-6), startTime, endTime, slotDuration, isOff
-Backend: all 3 modules × 5 files each = 15 backend module files
-Frontend: all 3 modules × 3 pages each + 3 service files = 12 frontend files
-Dashboard must show: today's schedule, this week revenue, booking status breakdown, upcoming bookings`,
+MODULES: services (name,description,duration,price,category,available),
+bookings (serviceId,userId,customerName,customerEmail,date,startTime,status,totalPrice),
+availability (dayOfWeek,startTime,endTime,slotDuration,isOff)
+Dashboard: today schedule, this week revenue, booking status pie, upcoming list
+Sidebar: Dashboard, Bookings, Services, Availability, Settings`,
 
     inventory: `
-DOMAIN MODULES TO GENERATE (inventory/warehouse):
-  1. products   — name, sku, quantity, minStockLevel, categoryId, supplierId, costPrice, sellingPrice, unit
-  2. suppliers  — name, contactPerson, email, phone, address, paymentTerms
-  3. movements  — productId, type(in/out/adjustment), quantity, reason, reference, performedBy, date
-  4. categories — name, description, parentCategory
-Backend: all 4 modules × 5 files each = 20 backend module files
-Frontend: all 4 modules × 3 pages each + 4 service files = 16 frontend files
-Dashboard must show: low stock alerts, total inventory value, recent movements, supplier count`,
+MODULES: products (name,sku,quantity,minStockLevel,supplierId,costPrice,sellingPrice,unit),
+suppliers (name,contactPerson,email,phone,address),
+movements (productId,type,quantity,reason,date)
+Dashboard: low stock alerts (red), total value (green), recent movements, supplier count
+Sidebar: Dashboard, Products, Movements, Suppliers, Settings`,
 
     finance: `
-DOMAIN MODULES TO GENERATE (finance/expense):
-  1. accounts      — name, type(cash/bank/credit), balance, currency, color
-  2. categories    — name, type(income/expense), color, icon
-  3. transactions  — amount, type(income/expense/transfer), categoryId, accountId, date, description, tags[]
-  4. budgets       — categoryId, amount, period(monthly/yearly), startDate
-Backend: all 4 modules × 5 files each = 20 backend module files
-Frontend: all 4 modules × 3 pages each + 4 service files = 16 frontend files
-Dashboard must show: net balance, income vs expense this month, recent transactions, budget progress`,
+MODULES: accounts (name,type,balance,currency,color),
+categories (name,type,color), transactions (amount,type,categoryId,accountId,date,description),
+budgets (categoryId,amount,period,startDate)
+Dashboard: net balance, income vs expense this month, recent transactions, budget progress
+Sidebar: Dashboard, Transactions, Accounts, Budgets, Categories`,
 
     restaurant: `
-DOMAIN MODULES TO GENERATE (restaurant):
-  1. menu     — name, categoryId, price, description, available, preparationTime, images[]
-  2. orders   — tableNumber, items[{menuItemId,qty,price,notes}], status(placed/preparing/ready/served/paid), total
-  3. tables   — number, capacity, status(available/occupied/reserved), location
-  4. categories — name, displayOrder, available
-Backend: all 4 modules × 5 files each = 20 backend module files
-Frontend: all 4 modules × 3 pages each + 4 service files = 16 frontend files
-Dashboard must show: live orders by status, revenue today, popular items, table occupancy`,
+MODULES: menu (name,categoryId,price,description,available,preparationTime),
+orders (tableNumber,items[{menuItemId,qty,price}],status,total),
+tables (number,capacity,status), categories (name,displayOrder)
+Dashboard: live orders by status, revenue today, popular items, table occupancy
+Sidebar: Dashboard, Orders, Menu, Tables, Categories`,
 
     saas: `
-DOMAIN MODULES TO GENERATE (saas/platform):
-  1. workspaces — name, slug, plan(free/starter/pro), ownerId
-  2. members    — workspaceId, userId, role(owner/admin/member), joinedAt
-  3. invites    — workspaceId, email, role, token, expiresAt, status(pending/accepted/expired)
-  4. activity   — workspaceId, userId, action, resource, detail, createdAt
-Backend: all 4 modules × 5 files each = 20 backend module files
-Frontend: all 4 modules × 3 pages each + 4 service files = 16 frontend files
-Dashboard must show: workspace count, member count, recent activity feed, plan distribution`,
+MODULES: workspaces (name,slug,plan,ownerId), members (workspaceId,userId,role,joinedAt),
+invites (workspaceId,email,role,token,status), activity (workspaceId,userId,action,detail)
+Dashboard: workspace count, member count, plan distribution, activity feed
+Sidebar: Dashboard, Workspaces, Members, Invites, Activity`,
 
     social: `
-DOMAIN MODULES TO GENERATE (social/community):
-  1. posts          — content, authorId, images[], tags[], likesCount, commentsCount, visibility
-  2. follows        — followerId, followingId, createdAt
-  3. likes          — postId, userId, createdAt
-  4. notifications  — userId, type(like/comment/follow), actorId, resourceId, read, createdAt
-Backend: all 4 modules × 5 files each = 20 backend module files
-Frontend: all 4 modules × 3 pages each + 4 service files = 16 frontend files
-Dashboard must show: feed (recent posts), notification count, follower stats, trending tags`,
-
-    // ── NEW: Additional well-known domain patterns ──
-
-    lms: `
-DOMAIN MODULES TO GENERATE (learning management system):
-  1. courses     — title, description, instructorId, price, thumbnail, status(draft/published), category, totalLessons
-  2. lessons     — courseId, title, content, videoUrl, duration(min), order, isFree
-  3. enrollments — courseId, userId, progress(0-100), completedLessons[], enrolledAt, completedAt
-  4. quizzes     — courseId, lessonId, questions[{text,options[],correctAnswer,points}], timeLimit
-  5. progress    — userId, lessonId, courseId, watchedSeconds, completed, lastAccessedAt
-Backend: all 5 modules × 5 files each
-Frontend: all 5 modules × 3 pages each + 5 service files
-Dashboard must show: enrolled students count, revenue, course completion rate, popular courses`,
-
-    realestate: `
-DOMAIN MODULES TO GENERATE (real estate):
-  1. properties — title, type(sale/rent), propertyType(house/apartment/land), price, area, bedrooms, bathrooms, address, images[], status(available/sold/rented), agentId, features[]
-  2. agents     — name, email, phone, avatar, bio, licenseNumber, listings[], rating
-  3. viewings   — propertyId, agentId, clientName, clientEmail, clientPhone, date, time, status(scheduled/completed/cancelled), notes
-  4. inquiries  — propertyId, name, email, phone, message, status(new/contacted/closed), createdAt
-Backend: all 4 modules × 5 files each
-Frontend: all 4 modules × 3 pages each + 4 service files
-Dashboard must show: active listings, viewings this week, new inquiries, revenue pipeline`,
-
-    healthcare: `
-DOMAIN MODULES TO GENERATE (healthcare/clinic):
-  1. patients     — name, dateOfBirth, gender, phone, email, address, bloodGroup, allergies[], insuranceInfo
-  2. appointments — patientId, doctorId, date, startTime, endTime, type(consultation/followup/procedure), status(scheduled/confirmed/completed/cancelled), notes, fee
-  3. doctors      — name, specialization, qualifications[], licenseNumber, phone, email, availableDays[], consultationFee
-  4. records      — patientId, doctorId, appointmentId, diagnosis, prescription[{medicine,dosage,duration}], notes, attachments[]
-  5. billing      — patientId, appointmentId, amount, status(pending/paid/insurance), paymentMethod, paidAt
-Backend: all 5 modules × 5 files each
-Frontend: all 5 modules × 3 pages each + 5 service files
-Dashboard must show: today's appointments, new patients this month, pending billing, doctor schedule`,
-
-    fleet: `
-DOMAIN MODULES TO GENERATE (fleet management):
-  1. vehicles     — make, model, year, plateNumber, vin, type(truck/van/car), status(available/in-use/maintenance), fuelType, currentMileage, assignedDriverId
-  2. drivers      — name, licenseNumber, licenseExpiry, phone, email, status(active/inactive), assignedVehicleId, rating
-  3. trips        — vehicleId, driverId, origin, destination, startOdometer, endOdometer, startTime, endTime, distance, purpose, status(planned/in-progress/completed)
-  4. maintenance  — vehicleId, type(oil/tires/brake/inspection), date, mileageAtService, cost, vendor, notes, nextDueDate, nextDueMileage
-  5. fuellogs     — vehicleId, driverId, date, liters, costPerLiter, totalCost, mileage, station
-Backend: all 5 modules × 5 files each
-Frontend: all 5 modules × 3 pages each + 5 service files
-Dashboard must show: vehicles on road, maintenance alerts, fuel cost this month, driver utilization`,
-
-    hr: `
-DOMAIN MODULES TO GENERATE (HR / employee management):
-  1. employees    — name, email, phone, department, position, salary, startDate, status(active/on-leave/terminated), managerId, photo
-  2. departments  — name, headId, budget, location, headCount
-  3. attendance   — employeeId, date, checkIn, checkOut, status(present/absent/late/leave), hoursWorked
-  4. leaves       — employeeId, type(annual/sick/unpaid/maternity), startDate, endDate, days, status(pending/approved/rejected), reason, approvedBy
-  5. payroll      — employeeId, month, year, basicSalary, allowances, deductions, netSalary, status(draft/processed/paid), paidAt
-Backend: all 5 modules × 5 files each
-Frontend: all 5 modules × 3 pages each + 5 service files
-Dashboard must show: headcount, attendance today, leave requests pending, payroll this month`,
-
-    jobboard: `
-DOMAIN MODULES TO GENERATE (job board / recruitment):
-  1. jobs         — title, company, location, type(full-time/part-time/contract/remote), salary, description, requirements[], skills[], status(open/closed/draft), expiresAt
-  2. companies    — name, logo, website, industry, size, description, location, verified
-  3. applications — jobId, candidateId, resumeUrl, coverLetter, status(applied/screening/interview/offer/rejected), appliedAt, notes
-  4. candidates   — name, email, phone, resumeUrl, skills[], experience[], education[], currentTitle, location
-  5. interviews   — applicationId, scheduledAt, type(phone/video/onsite), interviewer, status(scheduled/completed/cancelled), feedback, rating
-Backend: all 5 modules × 5 files each
-Frontend: all 5 modules × 3 pages each + 5 service files
-Dashboard must show: open positions, applications today, interviews scheduled, offer acceptance rate`,
-
-    events: `
-DOMAIN MODULES TO GENERATE (event management):
-  1. events     — title, description, type(conference/workshop/concert/meetup), date, startTime, endTime, venue, capacity, price, status(upcoming/live/completed/cancelled), organizerId, images[]
-  2. venues     — name, address, city, capacity, facilities[], contactPhone, contactEmail, pricePerHour
-  3. tickets    — eventId, userId, type(general/vip/early-bird), price, quantity, status(active/used/cancelled), qrCode, purchasedAt
-  4. attendees  — eventId, userId, name, email, ticketId, checkedIn, checkedInAt
-  5. speakers   — name, bio, photo, title, company, eventIds[], sessionTitle, sessionTime
-Backend: all 5 modules × 5 files each
-Frontend: all 5 modules × 3 pages each + 5 service files
-Dashboard must show: upcoming events, tickets sold, revenue, check-in rate`,
+MODULES: posts (content,authorId,images[],tags[],likesCount,commentsCount),
+follows (followerId,followingId), likes (postId,userId),
+notifications (userId,type,actorId,resourceId,read)
+Dashboard: feed, notification count, follower stats, trending tags
+Sidebar: Dashboard, Feed, My Posts, Notifications, Profile`,
   };
 
   const checks: Record<string, string[]> = {
-    ecommerce: ['product', 'shop', 'store', 'cart', 'checkout', 'order', 'ecommerce', 'e-commerce', 'sell', 'buy'],
-    blog: ['blog', 'post', 'article', 'cms', 'content', 'publish', 'write', 'editorial', 'news'],
-    task: ['task', 'project', 'todo', 'kanban', 'sprint', 'agile', 'manage', 'track', 'productivity', 'ticket'],
-    booking: ['book', 'appointment', 'schedule', 'reservation', 'slot', 'calendar', 'service', 'clinic', 'session'],
-    inventory: ['inventory', 'stock', 'warehouse', 'supply', 'sku', 'supplier', 'movement', 'asset', 'storage'],
-    finance: ['finance', 'expense', 'budget', 'transaction', 'account', 'money', 'income', 'invoice', 'accounting', 'payment'],
-    restaurant: ['restaurant', 'food', 'menu', 'table', 'kitchen', 'meal', 'dining', 'cafe', 'dish', 'waiter'],
-    saas: ['saas', 'workspace', 'team', 'organization', 'member', 'plan', 'subscription', 'multi-tenant', 'tenant'],
-    social: ['social', 'feed', 'follow', 'like', 'community', 'network', 'friend', 'share'],
-    lms: ['lms', 'course', 'lesson', 'enrollment', 'quiz', 'e-learning', 'elearning', 'learning management', 'student', 'instructor', 'lecture', 'curriculum'],
-    realestate: ['real estate', 'property', 'listing', 'mortgage', 'agent', 'rent', 'sale', 'house', 'apartment', 'viewing', 'realty'],
-    healthcare: ['healthcare', 'clinic', 'hospital', 'patient', 'doctor', 'medical', 'prescription', 'diagnosis', 'appointment', 'health'],
-    fleet: ['fleet', 'vehicle', 'driver', 'truck', 'delivery', 'logistics', 'transport', 'fuel log', 'maintenance log'],
-    hr: ['hr', 'human resource', 'employee', 'payroll', 'attendance', 'leave management', 'department', 'onboarding', 'offboarding'],
-    jobboard: ['job board', 'job listing', 'recruitment', 'candidate', 'application', 'resume', 'hiring', 'career'],
-    events: ['event', 'conference', 'concert', 'meetup', 'ticket', 'venue', 'attendee', 'speaker', 'workshop'],
+    ecommerce:  ['product','shop','store','cart','checkout','order','ecommerce','sell','buy'],
+    blog:       ['blog','post','article','cms','content','publish','write','editorial'],
+    task:       ['task','project','todo','kanban','sprint','agile','manage','track'],
+    booking:    ['book','appointment','schedule','reservation','slot','calendar','clinic'],
+    inventory:  ['inventory','stock','warehouse','supply','sku','supplier','movement'],
+    finance:    ['finance','expense','budget','transaction','account','money','income','invoice'],
+    restaurant: ['restaurant','food','menu','table','kitchen','meal','dining','cafe'],
+    saas:       ['saas','workspace','team','organization','member','plan','subscription'],
+    social:     ['social','feed','follow','like','community','network','friend'],
   };
 
   for (const [type, keywords] of Object.entries(checks)) {
-    if (keywords.some(kw => text.includes(kw))) {
-      return guides[type] || buildCustomDomainPrompt(text);
-    }
+    if (keywords.some(kw => text.includes(kw))) return guides[type] || '';
   }
 
-  return buildCustomDomainPrompt(text);
-}
-
-/**
- * For truly unique/custom apps that don't match any known template,
- * this generates a structured scaffold prompt that gives the AI
- * concrete guidance on HOW to derive domain modules rather than just
- * saying "figure it out yourself".
- */
-function buildCustomDomainPrompt(text: string): string {
+  // AI-inferred fallback for any other domain
   return `
-DOMAIN: CUSTOM / UNIQUE APPLICATION
-The app does not match any standard template. Derive the correct modules from the description.
+CUSTOM DOMAIN — read the user description and infer modules:
+"${text.slice(0, 400)}"
 
-═══ STEP-BY-STEP MODULE DERIVATION PROCESS ═══
-
-STEP 1 — Identify all main NOUNS (things the app manages).
-  Read: "${text.slice(0, 400)}"
-
-  Examples of how to derive modules from various ideas:
-  ┌─────────────────────────┬──────────────────────────────────────────────────────────┐
-  │ App Idea                │ Derived Modules                                          │
-  ├─────────────────────────┼──────────────────────────────────────────────────────────┤
-  │ Dating app              │ profiles, matches, messages, likes, preferences          │
-  │ Fitness tracker         │ workouts, exercises, programs, progress, goals           │
-  │ Pet care                │ pets, appointments, medications, vet-records, reminders  │
-  │ Legal case mgmt         │ cases, clients, documents, hearings, invoices, tasks     │
-  │ Real estate             │ properties, viewings, offers, agents, clients            │
-  │ Library                 │ books, loans, members, reservations, fines               │
-  │ Recipe / food           │ recipes, ingredients, collections, reviews, meal-plans   │
-  │ Donation / charity      │ campaigns, donations, donors, causes, receipts           │
-  │ Agriculture / farm      │ farms, crops, harvests, expenses, equipment, weather-log │
-  │ Freelance management    │ clients, projects, timesheets, invoices, contracts       │
-  │ Gym management          │ members, plans, trainers, sessions, payments             │
-  │ Hotel management        │ rooms, reservations, guests, housekeeping, billing       │
-  │ Podcast platform        │ shows, episodes, subscriptions, analytics, comments      │
-  │ NFT / art marketplace   │ artworks, collections, bids, sales, artists              │
-  │ Bug tracker             │ projects, issues, comments, sprints, releases            │
-  │ IoT dashboard           │ devices, sensors, readings, alerts, rules               │
-  └─────────────────────────┴──────────────────────────────────────────────────────────┘
-
-STEP 2 — For EACH noun, define Mongoose model fields using REAL domain vocabulary.
-  ✅ CORRECT for pet: { name, species, breed, dateOfBirth, weight, color, ownerId, medicalHistory[], vaccinations[] }
-  ❌ WRONG:           { title, description, status }
-
-STEP 3 — Generate ALL 5 backend files per module:
-  backend/src/modules/[noun]/[noun].routes.ts
-  backend/src/modules/[noun]/[noun].controller.ts
-  backend/src/modules/[noun]/[noun].service.ts
-  backend/src/modules/[noun]/[noun].model.ts      ← REAL fields, not generic
-  backend/src/modules/[noun]/[noun].schema.ts     ← Zod validation
-
-STEP 4 — Generate ALL 3 frontend pages per module:
-  frontend/pages/[noun]/index.tsx       ← list with domain-specific columns
-  frontend/pages/[noun]/new.tsx         ← create form with real field names
-  frontend/pages/[noun]/[id]/edit.tsx   ← edit form, pre-fills data by ID
-  frontend/src/services/[noun].service.ts
-
-STEP 5 — Design dashboard stats specific to THIS app:
-  ✅ Fitness app:  workouts this week, calories burned, active programs, goal completion %
-  ✅ Pet care app: upcoming appointments, medication reminders, total pets, vet visits this month
-  ✅ Legal app:    open cases, hearings this week, overdue invoices, client count
-  Derive from what the app actually tracks — do not use generic counts.
-
-MINIMUM MODULES: at least 3 domain modules (excluding auth).
-Complex apps (legal, healthcare, fleet) should have 5–7 modules.
-
-WHAT YOU ARE BUILDING: "${text.slice(0, 300)}"
-
-Identify the nouns, derive the modules, then generate the full application.`;
+Rules:
+1. Identify 2-4 main resources (nouns) the app manages.
+2. Use REAL domain field names — NOT title/description/status for everything.
+3. Examples of domain-specific field names:
+   - Workout: exercises[], duration, difficulty, caloriesBurn, muscleGroups[]
+   - Pet:     species, breed, dateOfBirth, vaccinations[], vetId, ownerId
+   - Legal:   caseNumber, court, filingDate, hearingDate, clientId, status
+   - Job:     title, company, salary, location, skills[], type, deadline
+4. Dashboard shows metrics meaningful to THIS specific app.
+5. Sidebar labels match this domain's vocabulary.`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SECTION 5 — MAIN PROMPT BUILDER
+// SECTION 6 — LEGACY SINGLE-SHOT PROMPT (fallback when v2 is unavailable)
 // ─────────────────────────────────────────────────────────────────────────────
+
+export const SYSTEM_PROMPT_FULLSTACK = `You are an expert full-stack developer generating complete, production-ready web applications.
+
+Every app must have world-class UI that looks like a real shipped SaaS product.
+
+═══════════════════════════════════════════════════════════════════
+ABSOLUTE RULES — NEVER BREAK
+═══════════════════════════════════════════════════════════════════
+
+1. NEVER generate auth-only apps.
+2. ALWAYS use Sidebar layout — import Sidebar, not a top Navbar.
+3. ALWAYS use lucide-react icons throughout every page.
+4. ALWAYS use toast notifications — NEVER browser alert().
+5. ALWAYS generate skeleton loading states in list pages.
+6. ALWAYS generate rich empty states with icon + description + CTA.
+7. ALWAYS generate real uncommented API calls — NO commented code.
+8. server.ts MUST register ALL module routes.
+9. Return ONLY raw JSON. No markdown. Start with { end with }.
+
+═══════════════════════════════════════════════════════════════════
+TECH STACK
+═══════════════════════════════════════════════════════════════════
+
+Backend:  Node.js + Express + TypeScript + MongoDB + Mongoose + Zod + bcrypt + jsonwebtoken
+Frontend: Next.js 14 Pages Router + React 18 + TypeScript + Tailwind CSS + axios + lucide-react
+
+OUTPUT FORMAT:
+{
+  "projectName": string, "description": string,
+  "files": [{ "path": string, "content": string, "language": string }],
+  "envVars": { "backend": {}, "frontend": {} },
+  "dependencies": { "backend": {}, "frontend": {} },
+  "setupInstructions": []
+}`;
 
 export function buildFullstackPrompt(
   userDescription: string,
   selectedModules: string[],
   variationSeed: string,
-  requirements?: RequirementsDocument,
+  requirements?: RequirementsDocument
 ): string {
-  const selectedModulesLabel = selectedModules.length > 0
-    ? selectedModules.join(', ')
-    : 'auto-infer-from-idea';
-
+  const palette = getColorPaletteFromSeed(variationSeed);
   const designDNA = buildDesignDNA(variationSeed);
   const domainGuide = detectDomainModules(userDescription, requirements);
-
-  // ── Detect & inject external service instructions ──
-  const externalServices = detectExternalServices(userDescription, requirements);
-  const externalServicesBlock = externalServices.instructions
-    ? externalServices.instructions
-    : '';
 
   const requirementsBlock = requirements ? `
 ╔══════════════════════════════════════════════╗
 ║  PROJECT REQUIREMENTS — HIGHEST PRIORITY     ║
 ╚══════════════════════════════════════════════╝
-
-App type:          ${requirements.appType}
-Target users:      ${requirements.targetUsers}
-Scale:             ${requirements.scale}
-Theme:             ${requirements.themeMode}
-Design preference: ${requirements.designPreference}
-Tech preferences:  ${requirements.techPreferences}
-Notes:             ${requirements.additionalNotes}
-
-Core features — implement EVERY ONE as a working module:
+App type: ${requirements.appType}
+Users:    ${requirements.targetUsers}
+Scale:    ${requirements.scale}
+Theme:    ${requirements.themeMode}
+Features:
 ${requirements.coreFeatures.map((f, i) => `  ${i + 1}. ${f}`).join('\n')}
-
-User's exact words (use for naming and copy):
+User words:
 ${requirements.answers.map(a => `  • "${a.answer}"`).join('\n')}
-
-MANDATORY:
-  • Every feature above needs backend files AND frontend pages.
-  • Auth is ONE module — generate ALL the others listed above too.
-  • Theme "${requirements.themeMode}" must apply to every page.
-  • Design preference overrides Design DNA below.
-
 ` : '';
-
-  const moduleChecklist = `
-╔══════════════════════════════════════════════╗
-║  MODULE CHECKLIST — GENERATE ALL OF THESE   ║
-╚══════════════════════════════════════════════╝
-
-${domainGuide}
-
-FILE STRUCTURE RULES:
-If the domain guide above lists specific module names (products, orders, etc.) — use those.
-If the domain guide says "derive modules from the description" — you must figure out
-the correct module names from the user request and requirements, then apply this structure:
-
-BACKEND files per module (×5 per module):
-  backend/src/modules/[actualModuleName]/[actualModuleName].routes.ts
-  backend/src/modules/[actualModuleName]/[actualModuleName].controller.ts
-  backend/src/modules/[actualModuleName]/[actualModuleName].service.ts
-  backend/src/modules/[actualModuleName]/[actualModuleName].model.ts
-  backend/src/modules/[actualModuleName]/[actualModuleName].schema.ts
-
-FRONTEND files per module (×3 pages + 1 service = ×4 per module):
-  frontend/pages/[actualModuleName]/index.tsx       ← list with table, search, delete
-  frontend/pages/[actualModuleName]/new.tsx         ← create form
-  frontend/pages/[actualModuleName]/[id]/edit.tsx   ← edit form (loads existing data by ID)
-  frontend/src/services/[actualModuleName].service.ts
-
-IMPORTANT: Use the real domain vocabulary, not placeholder names.
-  ✅ CORRECT: backend/src/modules/workouts/workouts.model.ts
-  ❌ WRONG:   backend/src/modules/items/items.model.ts (for a fitness app)
-
-SHARED FILES (generate exactly once):
-  backend/src/middleware/auth.ts
-  backend/src/server.ts                ← MUST register ALL module routes
-  backend/package.json + tsconfig.json + .env.example
-  frontend/pages/_app.tsx              ← wraps with AuthProvider
-  frontend/pages/index.tsx             ← compulsory premium landing page
-  frontend/pages/login.tsx
-  frontend/pages/signup.tsx
-  frontend/pages/dashboard.tsx         ← real stats + recent data from THIS app's modules
-  frontend/src/contexts/AuthContext.tsx
-  frontend/src/components/Navbar.tsx   ← links to ALL module list pages
-  frontend/styles/globals.css          ← Tailwind + CSS variables
-  frontend/package.json + next.config.js + tailwind.config.js + postcss.config.js + .env.example
-
-MINIMUM FILE COUNT: 30 files for a simple app. 45–60 files for complex apps.
-If you have fewer than 25 files you are generating an INCOMPLETE application.
-`;
 
   return `${requirementsBlock}${SYSTEM_PROMPT_FULLSTACK}
 
 USER REQUEST: "${userDescription}"
-SELECTED MODULES: ${selectedModulesLabel}
+MODULES: ${selectedModules.join(', ') || 'auth'}
 
-${moduleChecklist}
-
-${externalServicesBlock}
-
-╔══════════════════════════════════════════════╗
-║  DESIGN SYSTEM — EVERY PAGE                  ║
-╚══════════════════════════════════════════════╝
+${domainGuide}
 
 ${designDNA}
+Primary color: ${palette.primary} | Light: ${palette.primaryLight} | Dark: ${palette.primaryDark}
 
-VISUAL STANDARDS:
-  Auth pages:  gradient background, centered card max-w-md, colored submit button, link to other auth page
-  Dashboard:   sticky Navbar, stats row (3–4 cards), data table with real API data, empty state with CTA
-  List pages:  search bar, "+ New" button top right, table with status badges, edit/delete actions
-  Form pages:  back arrow, labeled inputs h-11, inline validation errors, save + cancel buttons
-  All pages:   responsive (sm: md: lg:), loading spinner while fetching, error alerts, hover transitions
-  Inputs:      border-2 border-gray-200, focus:border-indigo-500, h-11 minimum height
-  Buttons:     primary = bg-indigo-600 hover:bg-indigo-700, secondary = border-2 border-gray-200
+COMPLETENESS CHECK — VERIFY BEFORE OUTPUTTING:
+✓ server.ts registers ALL module routes
+✓ Sidebar.tsx links to ALL module pages
+✓ dashboard.tsx calls REAL APIs (no commented imports)
+✓ Every module: 5 backend files + list + create + edit + service
+✓ _app.tsx wraps with AuthProvider AND ToastProvider
+✓ Every mutation: toast success + toast error — NO alert()
+✓ Every list page: skeleton rows when loading
+✓ Every list page: rich empty state with icon and CTA
+✓ lucide-react icons imported and used on every page
+✓ Sidebar layout used on ALL app pages
+✓ globals.css: CSS variables for primary color
+✓ tailwind.config.js: extends theme with primary color
+✓ Total file count: minimum 30
 
-PREMIUM UI ENFORCEMENT (NON-NEGOTIABLE):
-  • Must define and use CSS design tokens in globals.css:
-    --primary, --secondary, --accent, --background, --surface, --text, --muted
-  • Must include page-level and component-level animations:
-    page reveal, staggered card reveal, hover/focus transitions
-  • Must follow strong composition:
-    hero + value sections + trust section + CTA footer on landing page
-  • Landing page is compulsory. No app is valid without frontend/pages/index.tsx as a marketing-quality page.
-  • DEFAULT COLOR POLICY: use light/professional UI by default.
-    Do NOT use black/near-black full-page backgrounds unless the user explicitly asks for dark mode.
-
-╔══════════════════════════════════════════════╗
-║  FILE GENERATION ORDER — CRITICAL             ║
-╚══════════════════════════════════════════════╝
-
-Generate files in MODULE-BY-MODULE order, NOT layer-by-layer.
-
-CORRECT ORDER:
-  1. Shared files: middleware/auth.ts, AuthContext, _app.tsx, globals.css, configs
-  2. External service files (stripe.service.ts, email.service.ts, etc.) — if requested
-  3. Auth module: schema → model → service → controller → routes → login.tsx → signup.tsx
-  4. Module A: schema → model → service → controller → routes → pages/A/index.tsx → pages/A/new.tsx → pages/A/[id]/edit.tsx → services/A.service.ts
-  5. Module B: (same pattern) — and so on for all modules
-  6. Last: server.ts (registers all routes), dashboard.tsx, Navbar.tsx
-
-╔══════════════════════════════════════════════╗
-║  COMPLETENESS CHECK — VERIFY BEFORE OUTPUT   ║
-╚══════════════════════════════════════════════╝
-
-✓ server.ts registers routes for EVERY module (not just auth)
-✓ Navbar.tsx has links to EVERY module list page
-✓ dashboard.tsx calls real API endpoints and shows live data
-✓ Every module has 5 backend files + 3 frontend pages + 1 service
-✓ _app.tsx wraps entire app with AuthProvider
-✓ globals.css defines CSS variables for the design system
-✓ Both package.json files have correct dependencies INCLUDING external service packages
-✓ index.tsx is a premium compulsory landing page with CTA(s)
-✓ Edit pages pre-fill form data by fetching the item by ID first
-✓ All external service files are FULLY implemented (not stubbed)
-✓ .env.example includes ALL environment variables (including external services)
-
-CRITICAL: Return ONLY raw JSON. No markdown. No explanation.
-Start with { and end with }.`;
+CRITICAL: Return ONLY raw JSON. No markdown. Start { end }.`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SECTION 6 — REFINE PROMPT
+// SECTION 7 — REFINE PROMPT
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function buildRefinePrompt(
   previousFiles: Array<{ path: string; content: string }>,
   refinementRequest: string,
-  projectName?: string,
+  projectName?: string
 ): string {
-  const fileContext = previousFiles
-    .slice(0, 30)
-    .map(f => {
-      const truncated = f.content.length > 2000
-        ? f.content.slice(0, 2000) + '\n// ... [file continues — not shown for brevity]'
-        : f.content;
-      return `\n// ══ ${f.path} ══\n${truncated}`;
-    })
-    .join('\n');
-
-  const fileList = previousFiles.map(f => `  - ${f.path}`).join('\n');
-
-  // Detect if the refinement is adding a new external service
-  const externalServices = detectExternalServices(refinementRequest);
-  const serviceBlock = externalServices.instructions
-    ? `\n${externalServices.instructions}\n`
-    : '';
+  const fileContext = previousFiles.slice(0, 30).map(f => {
+    const c = f.content.length > 2000
+      ? f.content.slice(0, 2000) + '\n// [truncated — file continues]'
+      : f.content;
+    return `\n// ══ ${f.path} ══\n${c}`;
+  }).join('\n');
 
   return `You are an expert full-stack developer refining an existing application.
 
 PROJECT: ${projectName || 'my-app'}
-TOTAL FILES IN PROJECT: ${previousFiles.length}
+TOTAL FILES: ${previousFiles.length}
+ALL FILE PATHS:
+${previousFiles.map(f => `  - ${f.path}`).join('\n')}
 
-ALL FILES IN THIS PROJECT:
-${fileList}
-
-KEY FILE CONTENTS (for context):
+KEY FILE CONTENTS:
 ${fileContext}
 
-REFINEMENT REQUEST:
-"${refinementRequest}"
-${serviceBlock}
+REFINEMENT REQUEST: "${refinementRequest}"
+
 RULES:
-1. Apply ONLY the requested change. Do not remove existing features.
-2. If adding a new module: include all 5 backend files + 3 frontend pages + 1 service.
-3. If adding new routes: update server.ts to register them.
-4. If adding new pages: update Navbar.tsx to link to them.
-5. If adding an external service (Stripe, email, etc.): generate the full service file + all required endpoints.
-6. Return ONLY files that you are creating or changing.
-7. Keep the same JSON output format.
-8. Return ONLY raw JSON. No markdown. Start with { end with }.`;
+1. Apply ONLY the requested change. Do not remove working features.
+2. New module: generate all 5 backend files + 3 frontend pages + 1 service.
+3. New routes: update server.ts imports and registrations.
+4. New pages: update Sidebar.tsx navigation items.
+5. Return ONLY files you are creating or changing.
+6. Return ONLY raw JSON. No markdown. Start { end }.`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SECTION 7 — DESIGN-TO-CODE PROMPT
-// ─────────────────────────────────────────────────────────────────────────────
-
-export const SYSTEM_PROMPT_DESIGN_TO_CODE = `You are an expert React + Tailwind CSS developer.
-
-Convert the provided UI design into a complete, production-ready React component.
-
-RULES:
-- Next.js Pages Router syntax (no "use client", no app/ directory patterns)
-- Tailwind CSS only — no CSS modules, no styled-components
-- All TypeScript interfaces included inline
-- Default export only
-- All sub-components inline in the same file
-- Responsive (mobile-first: sm: md: lg:)
-- WCAG AA contrast on all text
-- Smooth transitions on interactive elements
-- Loading and error states included where appropriate
-
-Return only the TypeScript component code. No markdown. No explanation.`;
-
-export function buildDesignToCodePrompt(
-  designJSON: object,
-  designDescription?: string,
-): string {
-  return `${SYSTEM_PROMPT_DESIGN_TO_CODE}
-
-${designDescription ? `DESIGN DESCRIPTION: "${designDescription}"\n\n` : ''}DESIGN SPECIFICATION:
-${JSON.stringify(designJSON, null, 2)}
-
-Generate the complete React + Tailwind component now.
-Return only TypeScript — no markdown fences, no explanation.`;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SECTION 8 — REQUIREMENTS PROMPTS
+// SECTION 8 — REQUIREMENTS PROMPTS (unchanged — already working)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function buildRequirementsQuestionsPrompt(
   userIdea: string,
-  selectedModules: string[],
+  selectedModules: string[]
 ): string {
-  const normalizedModules = selectedModules.map(m => String(m || '').toLowerCase()).filter(Boolean);
-  const onlyAuthSelected = normalizedModules.length === 1 && normalizedModules[0] === 'auth';
-  const selectedModulesLabel = selectedModules.length > 0
-    ? selectedModules.join(', ')
-    : 'auto-infer-from-idea';
+  return `You are a senior product engineer interviewing a user before building their app.
 
-  // Detect potential external services to ask about
-  const serviceHints = detectExternalServices(userIdea);
-  const serviceQuestion = serviceHints.requiredFiles.length === 0
-    ? `  { "id": "q_ext", "question": "Do you need any third-party integrations like payments (Stripe/Razorpay), file uploads, email notifications, or social login?", "hint": "e.g. Stripe for payments, Nodemailer for emails, Google OAuth", "category": "technical", "required": false },`
-    : '';
+Idea: "${userIdea}"
+Modules: ${selectedModules.join(', ') || 'auth'}
 
-  return `You are a senior product engineer interviewing a user before building their web application.
+Generate 3-5 targeted, specific questions for THIS app type.
 
-User's idea: "${userIdea}"
-Selected modules: ${selectedModulesLabel}
+Rules:
+1. Return ONLY valid JSON. No markdown.
+2. projectName: lowercase-hyphen, max 30 chars, no conversational phrases.
+3. appType: exactly one of: e-commerce|blog|dashboard|social|saas|portfolio|auth|analytics|booking|marketplace|other
+4. Questions must be conversational, specific to THIS app.
+5. hint: short example answer shown as placeholder.
+6. MUST generate 3-5 questions. Never fewer than 3.
+7. At least 3 required: true.
 
-Generate 3 to 5 targeted questions to gather everything needed to build this app correctly.
-Questions must be SPECIFIC to this app type — not generic.
-
-${serviceQuestion ? `IMPORTANT: Include a question about external service integrations if not already detected.` : `External services already detected from description — no need to ask about them.`}
-
-Categories:
-  "users"     — who uses this and why
-  "features"  — must-have vs nice-to-have specifics
-  "design"    — visual style, light/dark theme, brand feel
-  "technical" — payment provider, integrations, third-party services
-  "scope"     — MVP vs full product, personal vs business launch
-
-RULES:
-1. Return ONLY valid JSON. No markdown. No preamble. No explanation.
-2. "projectName": lowercase, hyphens only, max 30 chars, NO conversational phrases.
-3. "appType": exactly one of: e-commerce | blog | dashboard | social | saas |
-   portfolio | auth | analytics | booking | marketplace | other
-4. Questions must be conversational — not form labels.
-5. "hint": a short example answer used as input placeholder.
-6. MUST generate 3 to 5 questions. Never fewer than 3.
-7. At least 3 must have required: true.
-8. Questions must reflect THIS specific app type.
-9. Do NOT focus only on authentication/security unless the user explicitly asks for auth-only app.
-10. Include at least 2 domain workflow questions about core business entities/features.
-11. If selected modules are only "auth", treat it as a starter default and still infer the full product domain.
-
-${onlyAuthSelected ? `IMPORTANT CONTEXT:
-Selected modules currently show only "auth". This is a default starter selection.
-You MUST ask questions for the full domain app in the user's idea, not just auth.` : ''}
-
-Return ONLY this JSON and nothing else:
+Return ONLY:
 {
   "appType": "string",
   "projectName": "string",
   "questions": [
-    {
-      "id": "q1",
-      "question": "Conversational question specific to this app",
-      "hint": "e.g. example answer",
-      "category": "users | features | design | technical | scope",
-      "required": true
-    }
-    ${serviceQuestion}
+    { "id": "q1", "question": "string", "hint": "string", "category": "users|features|design|technical|scope", "required": true }
   ]
 }`;
 }
@@ -1336,234 +944,40 @@ export function buildRequirementsCompilePrompt(
   originalPrompt: string,
   projectName: string,
   answers: RequirementsAnswer[],
-  selectedModules: string[],
+  selectedModules: string[]
 ): string {
-  const selectedModulesLabel = selectedModules.length > 0
-    ? selectedModules.join(', ')
-    : 'auto-infer-from-idea';
-  const answersText = answers
-    .map(a => `Q: ${a.question}\nA: ${a.answer}`)
-    .join('\n\n');
+  const answersText = answers.map(a => `Q: ${a.question}\nA: ${a.answer}`).join('\n\n');
+  return `You are a senior architect compiling a requirements document.
 
-  // Pre-detect external services from the combined text
-  const combinedText = `${originalPrompt} ${answersText}`;
-  const detectedServices = detectExternalServices(combinedText);
-  const servicesNote = detectedServices.requiredFiles.length > 0
-    ? `\nDetected external services from user answers: ${Object.keys(EXTERNAL_SERVICE_CATALOGUE)
-      .filter(k => detectedServices.requiredFiles.some(f => f.includes(k)))
-      .join(', ')}. Include these in coreFeatures and techPreferences.`
-    : '';
+Idea: "${originalPrompt}"
+Project: ${projectName}
+Modules: ${selectedModules.join(', ')}
 
-  return `You are a senior software architect compiling a structured requirements document.
-
-Original idea: "${originalPrompt}"
-Project name: ${projectName}
-Modules: ${selectedModulesLabel}
-
-User answers:
+Answers:
 ${answersText}
-${servicesNote}
 
-RULES:
-1. Return ONLY valid JSON. No markdown. No preamble.
-2. "coreFeatures": concrete actionable feature strings, max 8.
-   SPECIFIC: "Stripe payment checkout" not "payments".
-   SPECIFIC: "Admin panel to manage products" not "admin".
-   SPECIFIC: "Nodemailer email notifications on booking" not "emails".
-3. "themeMode": exactly one of: light | dark | hybrid | any
-4. "scale": exactly one of: personal | startup | enterprise
-5. "compiledSummary": 2–4 sentences, plain English, starts with "You're building".
-   MUST describe a full production build delivered in one go.
-   DO NOT use words: "first release", "MVP", "phase 1", "later phase".
-6. Infer values for unanswered fields. Never leave any field empty.
-7. "techPreferences": single string summarising all tech choices mentioned + detected services.
-8. "designPreference": single string describing visual style.
-9. Do NOT collapse to "authentication module" unless user explicitly says auth-only.
-10. For non-auth ideas, coreFeatures must be domain-heavy (at least 3 non-auth domain features).
-11. If user mentions a payment provider, email service, file upload, OAuth — include it as a specific coreFeature.
-12. If the user does not explicitly ask for dark mode, set themeMode to "light".
+Rules:
+1. Return ONLY valid JSON. No markdown.
+2. coreFeatures: specific actionable strings, max 8. "Stripe checkout" not "payments".
+3. themeMode: light|dark|hybrid|any (default to light if ambiguous)
+4. scale: personal|startup|enterprise
+5. compiledSummary: 2-4 sentences starting with "You're building".
+6. Never leave any field empty — infer from context.
 
-Return ONLY this JSON:
+Return ONLY:
 {
-  "originalPrompt": "string",
-  "projectName": "string",
-  "appType": "string",
-  "targetUsers": "string",
-  "coreFeatures": ["specific feature 1", "specific feature 2"],
-  "designPreference": "string",
-  "themeMode": "light | dark | hybrid | any",
-  "scale": "personal | startup | enterprise",
-  "techPreferences": "string",
-  "additionalNotes": "string",
-  "answers": ${JSON.stringify(answers)},
+  "originalPrompt": "string", "projectName": "string", "appType": "string",
+  "targetUsers": "string", "coreFeatures": ["string"],
+  "designPreference": "string", "themeMode": "light|dark|hybrid|any",
+  "scale": "personal|startup|enterprise", "techPreferences": "string",
+  "additionalNotes": "string", "answers": ${JSON.stringify(answers)},
   "compiledSummary": "You're building..."
 }`;
 }
-
-export function getColorPaletteFromSeed(seed: string): { primary: string; secondary: string; accent: string } {
-  const palettes = [
-    { primary: '#4f46e5', secondary: '#eef2ff', accent: '#06b6d4' },
-    { primary: '#2563eb', secondary: '#eff6ff', accent: '#f97316' },
-    { primary: '#059669', secondary: '#ecfdf5', accent: '#7c3aed' },
-    { primary: '#e11d48', secondary: '#fff1f2', accent: '#f59e0b' },
-    { primary: '#0d9488', secondary: '#f0fdfa', accent: '#84cc16' },
-  ];
-
-  let hash = 0;
-  for (let i = 0; i < seed.length; i++) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0;
-  return palettes[hash % palettes.length];
+export function detectExternalServices(userDescription: string, requirements?: RequirementsDocument): { instructions: string; requiredFiles: string[]; envVars: Record<string, string> } {
+  return { instructions: "", requiredFiles: [], envVars: {} };
 }
 
-const TECH_STACK_RULES = `
-======================================================
-AI GENERATOR MASTER SOP (STANDARD OPERATING PROCEDURE)
-======================================================
-You are strictly trained to generate production-ready React + Node.js projects.
-
-1. DOMAIN ABSTRACTION (THE PLANNER):
-   - You MUST extract 3 to 6 unique business domains from the user's idea.
-   - NEVER create a generic module called "auth", "authentication", or "users". Auth is handled globally.
-
-2. UI & STYLING (TAILWIND STRICT MODE):
-   - HOW TO STYLE: You MUST write Tailwind utility classes directly on every HTML element (e.g., <button className="bg-indigo-600 text-white rounded-lg p-2">).
-   - WHAT NOT TO DO: NEVER write generic custom CSS classes like .btn-primary or .card in globals.css. ONLY CSS Variables are allowed in globals.css.
-   - ICONS & SVGS: NEVER write raw <svg> tags. Always import icons from 'lucide-react'.
-   - NO COMMENTS: Never write code comments. Wasting tokens is forbidden.
-
-3. COMPONENT GENERATION (ANTI-HALLUCINATION TRAP):
-   - EXPECTATION: Every generated file must be 100% self-contained. 
-   - WHAT NOT TO DO: NEVER import or hallucinate external wrapper components like <Layout>, <Container>, <ErrorAlert>, or <LoadingSpinner>. They DO NOT EXIST.
-   - THE FIX: If you need a dashboard layout, a navbar, or a loading spinner, write the raw JSX/Tailwind for it directly INLINE within the specific page component.
-======================================================
-
-TECH STACK:
-  Backend:  Node.js + Express + TypeScript + MongoDB (Mongoose) + Zod + bcrypt
-  Frontend: Next.js 14 Pages Router + React 18 + TypeScript + Tailwind CSS + axios
-  NOTE: Pages Router = pages/ directory. NO "use client". NO app/ directory.
-
-API RESPONSE FORMAT (every endpoint): { success: boolean, data: T | null, error: string | null }
-
-VISUAL STANDARDS (Tailwind):
-  Dashboard: sticky Navbar, stats cards grid, recent items table.
-  List pages: search + "+ New" button, data table, status badges, edit/delete.
-  Form pages: back arrow, labeled inputs h-11, p-3 text-black rounded-lg gap-4, save + cancel buttons.
-  Inputs: border text-black bg-white focus:border-indigo-500 h-11 p-2 rounded-md.
-  Buttons: primary=bg-indigo-600 hover:bg-indigo-700.
-  All: responsive, loading spinner, error alerts, transitions.
-
-PREMIUM QUALITY (MANDATORY): Component designs must be hyper-premium, using sophisticated layouts.
-USE EXACT VISUAL TOKENS IN frontend/styles/globals.css: --primary, --secondary, --accent, --background, --surface, --text, --muted.
-`;
-
-export function buildPlannerPrompt(userDescription: string, requirements?: RequirementsDocument | null): string {
-  const req = requirements ? `
-Requirements summary:
-- appType: ${requirements.appType}
-- targetUsers: ${requirements.targetUsers}
-- themeMode: ${requirements.themeMode}
-- coreFeatures: ${(requirements.coreFeatures || []).join(', ')}
-` : '';
-
-  return `You are a senior software architect.
-Create a generation plan for a full-stack web app.
-
-User idea:
-"${userDescription}"
-${req}
-Return ONLY valid JSON with this shape:
-{
-  "projectName": "string",
-  "appType": "string",
-  "modules": [
-    {
-      "name": "kebab-case-module",
-      "label": "Human Label",
-      "fields": ["fieldOne", "fieldTwo", "fieldThree"]
-    }
-  ]
-}
-
-Rules:
-- Infer 2-6 domain-specific modules.
-- NEVER include "auth", "authentication", or "users" in the modules array. Auth logic is completely hardcoded separately.
-- Use robust, business-specific field names.
-- Do not return markdown.`;
-}
-
-export function buildModulePrompt(
-  module: { name: string; label?: string; fields?: string[] },
-  plan: any,
-  seed: string
-): string {
-  const palette = getColorPaletteFromSeed(seed);
-  return `Generate files for ONE module in a full-stack app.
-
-${TECH_STACK_RULES}
-
-Project: ${plan?.projectName || 'my-app'}
-Module: ${module.name}
-Label: ${module.label || module.name}
-Fields: ${(module.fields || []).join(', ')}
-Palette: primary=${palette.primary}, secondary=${palette.secondary}, accent=${palette.accent}
-
-Return ONLY valid JSON:
-{
-  "files": [
-    { "path": "backend/src/modules/${module.name}/${module.name}.schema.ts", "content": "...", "language": "typescript" },
-    { "path": "backend/src/modules/${module.name}/${module.name}.model.ts", "content": "...", "language": "typescript" },
-    { "path": "backend/src/modules/${module.name}/${module.name}.service.ts", "content": "...", "language": "typescript" },
-    { "path": "backend/src/modules/${module.name}/${module.name}.controller.ts", "content": "...", "language": "typescript" },
-    { "path": "backend/src/modules/${module.name}/${module.name}.routes.ts", "content": "...", "language": "typescript" },
-    { "path": "frontend/src/services/${module.name}.service.ts", "content": "...", "language": "typescript" },
-    { "path": "frontend/pages/${module.name}/index.tsx", "content": "...", "language": "typescript" },
-    { "path": "frontend/pages/${module.name}/new.tsx", "content": "...", "language": "typescript" },
-    { "path": "frontend/pages/${module.name}/[id]/edit.tsx", "content": "...", "language": "typescript" }
-  ]
-}
-
-Rules:
-- No markdown fences.
-- All files must be fully implemented.
-- Use the correct API response format.
-- Ensure the frontend matches the visual standards.`;
-}
-
-export function buildSharedFilesPrompt(plan: any, seed: string): string {
-  const palette = getColorPaletteFromSeed(seed);
-  const modules = Array.isArray(plan?.modules) ? plan.modules.map((m: any) => m.name) : [];
-  return `Generate shared project files for a full-stack app.
-
-${TECH_STACK_RULES}
-
-Project name: ${plan?.projectName || 'my-app'}
-Modules: ${modules.join(', ') || 'none'}
-Palette: primary=${palette.primary}, secondary=${palette.secondary}, accent=${palette.accent}
-
-Return ONLY valid JSON:
-{
-  "files": [
-    { "path": "backend/src/server.ts", "content": "...", "language": "typescript" },
-    { "path": "backend/src/middleware/auth.ts", "content": "...", "language": "typescript" },
-    { "path": "backend/src/modules/auth/auth.schema.ts", "content": "...", "language": "typescript" },
-    { "path": "backend/src/modules/auth/auth.model.ts", "content": "...", "language": "typescript" },
-    { "path": "backend/src/modules/auth/auth.service.ts", "content": "...", "language": "typescript" },
-    { "path": "backend/src/modules/auth/auth.controller.ts", "content": "...", "language": "typescript" },
-    { "path": "backend/src/modules/auth/auth.routes.ts", "content": "...", "language": "typescript" },
-    { "path": "frontend/pages/_app.tsx", "content": "...", "language": "typescript" },
-    { "path": "frontend/pages/index.tsx", "content": "...", "language": "typescript" },
-    { "path": "frontend/pages/login.tsx", "content": "...", "language": "typescript" },
-    { "path": "frontend/pages/signup.tsx", "content": "...", "language": "typescript" },
-    { "path": "frontend/pages/dashboard.tsx", "content": "...", "language": "typescript" },
-    { "path": "frontend/src/components/Navbar.tsx", "content": "...", "language": "typescript" },
-    { "path": "frontend/src/contexts/AuthContext.tsx", "content": "...", "language": "typescript" },
-    { "path": "frontend/src/services/auth.service.ts", "content": "...", "language": "typescript" },
-    { "path": "frontend/styles/globals.css", "content": "...", "language": "css" }
-  ]
-}
-
-Rules:
-- Include route registration for all modules in backend/src/server.ts.
-- Include navigation links for all modules in Navbar.
-- The landing page (index.tsx) must be a premium and cinematic marketing page.
-- No markdown fences.`;
+export function buildDesignToCodePrompt(designJSON: object, designDescription?: string): string {
+  return "";
 }

@@ -1187,7 +1187,7 @@ export class AIService {
         const { routeDomainPack } = await import('./ai.domainRouter');
         const seed = randomUUID().slice(0, 8);
         const prompt = buildPlannerPrompt(userDescription, requirements);
-        const colorPalette = getColorPaletteFromSeed(seed);
+        const colorPalette: any = getColorPaletteFromSeed(seed);
         const route = routeDomainPack(userDescription);
 
         let raw = '';
@@ -1245,7 +1245,7 @@ export class AIService {
                     fields: Array.isArray(m?.fields) ? m.fields.map((f: any) => String(f)).filter(Boolean).slice(0, 12) : [],
                 }))
                 .slice(0, 8),
-            colorPalette: getColorPaletteFromSeed(seed),
+            colorPalette: getColorPaletteFromSeed(seed) as any,
             _seed: seed,
             _domainRouting: {
                 mode: route.mode,

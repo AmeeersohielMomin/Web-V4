@@ -1,7 +1,7 @@
-import { Octokit } from '@octokit/rest';
 import archiver from 'archiver';
 import { ProjectService } from './project.service';
 import { Readable } from 'stream';
+import { getOctokit } from '../../utils/octokit';
 
 export class GithubDeploymentService {
   private projectService: ProjectService;
@@ -18,6 +18,7 @@ export class GithubDeploymentService {
     githubRepo: string,
     githubToken: string
   ) {
+    const Octokit = await getOctokit();
     const octokit = new Octokit({
       auth: githubToken
     });

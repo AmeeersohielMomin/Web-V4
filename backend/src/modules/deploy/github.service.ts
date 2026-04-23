@@ -1,4 +1,4 @@
-import { Octokit } from '@octokit/rest';
+import { getOctokit } from '../../utils/octokit';
 
 type GeneratedFile = { path: string; content: string };
 
@@ -16,6 +16,7 @@ export class GitHubService {
     files: GeneratedFile[],
     isPrivate: boolean = false
   ): Promise<GitHubPushResult> {
+    const Octokit = await getOctokit();
     const octokit = new Octokit({ auth: githubToken });
 
     const { data: user } = await octokit.rest.users.getAuthenticated();
@@ -126,6 +127,7 @@ export class GitHubService {
     githubToken: string
   ): Promise<{ valid: boolean; username?: string }> {
     try {
+      const Octokit = await getOctokit();
       const octokit = new Octokit({ auth: githubToken });
       const { data: user } = await octokit.rest.users.getAuthenticated();
       return { valid: true, username: user.login };
